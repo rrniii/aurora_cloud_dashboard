@@ -39,6 +39,7 @@ LATEST_IMAGE = Path("/home/aurora/aurora_cloud_dashboard/last24h.png")
 QUICKLOOK_DIR = Path("/home/aurora/aurora_cloud_dashboard/quicklooks/ceilometer")
 
 _BASE_DS = None
+DATA_REFRESH_MS = 300_000  # reload base dataset every 5 minutes
 
 
 def _ensure_utc(dt):
@@ -64,6 +65,12 @@ def _get_base_dataset():
     return ds
 
 
+def _refresh_base_dataset():
+    """Drop the cached dataset so the next access reopens the Zarr (captures new data)."""
+    global _BASE_DS
+    _BASE_DS = None
+
+
 def _median_filter_nan(arr, k=3):
     """Simple nan-aware median filter with square window k x k."""
     if arr.ndim != 2 or k < 2:
@@ -85,12 +92,43 @@ def _dataset_time_bounds():
     return pd.to_datetime(times.min()).to_pydatetime(), pd.to_datetime(times.max()).to_pydatetime()
 
 
-def open_window(t0, t1):
-    """Slice the base dataset to [t0, t1], filter height, subsample, coarsen."""
+def _coarsen_targets(duration: timedelta | None, height_span: float | None):
+    """Return subsample/target counts that scale up for zoomed-in windows."""
+    time_subsample = TIME_SUBSAMPLE
+    time_target = TIME_TARGET
+    height_target = HEIGHT_TARGET
+    if duration is not None:
+        hours = duration.total_seconds() / 3600.0
+        if hours <= 2:
+            time_subsample = 1
+            time_target = 1200
+        elif hours <= 6:
+            time_subsample = 1
+            time_target = 800
+        elif hours <= 24:
+            time_subsample = 1
+            time_target = 400
+    if height_span is not None:
+        if height_span <= 1000:
+            height_target = 400
+        elif height_span <= 3000:
+            height_target = 300
+    return time_subsample, time_target, height_target
+
+
+def open_window(t0, t1, bottom_m=None, top_m=None):
+    """Slice the base dataset, adapt coarsening to window span, and filter height."""
     t0 = _ensure_utc(t0)
     t1 = _ensure_utc(t1)
     if t0 is None or t1 is None or t0 >= t1:
         return xr.Dataset()
+    duration = t1 - t0
+    height_span = None
+    if bottom_m is not None or top_m is not None:
+        b = max(bottom_m or 0.0, 0.0)
+        t = top_m if top_m is not None else HEIGHT_LOAD_MAX_M
+        height_span = max(t - b, 0.0)
+    time_subsample, time_target, height_target = _coarsen_targets(duration, height_span)
     base = _get_base_dataset()
     if base is None:
         return xr.Dataset()
@@ -104,18 +142,27 @@ def open_window(t0, t1):
     except Exception:
         ds = base
     try:
-        ds = ds.sel({"range": ds["range"] <= HEIGHT_LOAD_MAX_M})
+        ds = ds.sel({"range": slice(0, HEIGHT_LOAD_MAX_M)})
     except Exception:
         ds = ds.where(ds["range"] <= HEIGHT_LOAD_MAX_M, drop=True)
-    if TIME_SUBSAMPLE > 1:
-        ds = ds.isel(time=slice(None, None, TIME_SUBSAMPLE))
+    # If the user narrowed the plotted range, trim the data before coarsening so
+    # we keep more vertical detail within the zoomed band.
+    if bottom_m is not None or top_m is not None:
+        low = max(bottom_m or 0.0, 0.0)
+        high = min(top_m or HEIGHT_LOAD_MAX_M, HEIGHT_LOAD_MAX_M)
+        try:
+            ds = ds.sel({"range": slice(low, high)})
+        except Exception:
+            ds = ds.where((ds["range"] >= low) & (ds["range"] <= high), drop=True)
+    if time_subsample > 1:
+        ds = ds.isel(time=slice(None, None, time_subsample))
     # Coarsen to target sample counts to keep payloads small.
     try:
-        if ds.sizes.get("range", 0) > HEIGHT_TARGET:
-            fh = max(int(np.ceil(ds.sizes["range"] / HEIGHT_TARGET)), 1)
+        if ds.sizes.get("range", 0) > height_target:
+            fh = max(int(np.ceil(ds.sizes["range"] / height_target)), 1)
             ds = ds.coarsen({"range": fh}, boundary="trim").mean()
-        if ds.sizes.get("time", 0) > TIME_TARGET:
-            ft = max(int(np.ceil(ds.sizes["time"] / TIME_TARGET)), 1)
+        if ds.sizes.get("time", 0) > time_target:
+            ft = max(int(np.ceil(ds.sizes["time"] / time_target)), 1)
             ds = ds.coarsen({"time": ft}, boundary="trim").mean()
     except Exception:
         pass
@@ -145,7 +192,7 @@ def _make_plot(ds, var, clim, logz, coloraxis):
     return trace
 
 
-# Widgets / controls (Panel wires these into _view)
+# Widgets / controls (Panel wires these into the view updater)
 tmin, tmax = _dataset_time_bounds()
 default_end = tmax or datetime.utcnow()
 default_start = default_end - DEFAULT_WINDOW
@@ -165,6 +212,8 @@ calendar_instrument = pn.widgets.Select(name="Instrument", value="Ceilometer", o
 
 _live_guard = False
 _live_cb = None  # handle for periodic callback (used for live refresh)
+_relayout_guard = False  # prevents loops when syncing zoom back to widgets
+pn.state.add_periodic_callback(_refresh_base_dataset, period=DATA_REFRESH_MS, start=True)
 
 
 def _refresh_to_latest(_event=None):
@@ -176,6 +225,8 @@ def _refresh_to_latest(_event=None):
     start = end - DEFAULT_WINDOW
     range_start.value = start
     range_end.value = end
+    bottom_range_m.value = 0
+    top_range_m.value = TOP_RANGE_DEFAULT
     _live_guard = False
 
 
@@ -265,7 +316,7 @@ next_btn.on_click(_shift_next)
 
 def _on_manual_time_change(event):
     """Disable live mode if user edits time pickers manually."""
-    if _live_guard:
+    if _live_guard or _relayout_guard:
         return
     if live_toggle.value:
         _set_live(False)
@@ -273,6 +324,9 @@ def _on_manual_time_change(event):
 
 range_start.param.watch(_on_manual_time_change, "value")
 range_end.param.watch(_on_manual_time_change, "value")
+
+# Persistent plot pane so we can listen for zoom/pan events (relayout).
+plot_pane = pn.pane.Plotly(config={"responsive": True}, sizing_mode="stretch_both")
 
 
 @pn.depends(
@@ -284,12 +338,31 @@ range_end.param.watch(_on_manual_time_change, "value")
     beta_vmax.param.value,
     ldr_vmin.param.value,
     ldr_vmax.param.value,
+    watch=True,
 )
-def _view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
+def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
     """Render both heatmaps for the current window and control values."""
-    ds = open_window(start, end)
+    bottom = max(float(bottom_val), 0.0)
+    top = max(float(top_val), bottom + 100.0)
+    ds = open_window(start, end, bottom_m=bottom, top_m=top)
+    # Simple light theme for plots
+    bg = "white"
+    fg = "#222222"
+    grid = "#dddddd"
     if ds is None or not ds.data_vars:
-        return pn.pane.Markdown("No data")
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font=dict(color=fg, size=16),
+        )
+        fig.update_layout(height=600, paper_bgcolor=bg, plot_bgcolor=bg, margin=dict(l=40, r=40, t=40, b=40))
+        plot_pane.object = fig
+        return
     # Colorbar configs
     b_cmin = np.log10(bmin)
     b_cmax = np.log10(bmax)
@@ -329,22 +402,18 @@ def _view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
             row=2,
             col=1,
         )
-    bottom = max(float(bottom_val), 0.0)
-    top = max(float(top_val), bottom + 100.0)
     fig.update_yaxes(range=[bottom, top], title_text="Range (m)", row=1, col=1)
     fig.update_yaxes(range=[bottom, top], title_text="Range (m)", row=2, col=1)
     # Hourly ticks; add horizontal date annotations at 12:00.
     tickvals = []
     ticktext = []
     noon_annots = []
-    # Simple light theme for plots
-    bg = "white"
-    fg = "#222222"
-    grid = "#dddddd"
     if start and end:
         start_ts = pd.Timestamp(start)
         end_ts = pd.Timestamp(end)
-        hours = pd.date_range(start=start_ts.floor("h"), end=end_ts.ceil("h"), freq="h")
+        duration = end_ts - start_ts
+        freq = "2h" if duration > pd.Timedelta(hours=24) else "h"
+        hours = pd.date_range(start=start_ts.floor("h"), end=end_ts.ceil("h"), freq=freq)
         for t in hours:
             tickvals.append(t.to_pydatetime())
             ticktext.append(t.strftime("%H:%M"))
@@ -372,8 +441,8 @@ def _view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
         showgrid=True,
         gridcolor=grid,
         linecolor=fg,
-        tickfont=dict(color=fg),
-        title_font=dict(color=fg),
+        tickfont=dict(color=fg, size=12),
+        title_font=dict(color=fg, size=12),
         row=2,
         col=1,
     )
@@ -385,13 +454,15 @@ def _view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
         showgrid=True,
         gridcolor=grid,
         linecolor=fg,
-        tickfont=dict(color=fg),
-        title_font=dict(color=fg),
+        tickfont=dict(color=fg, size=12),
+        title_font=dict(color=fg, size=12),
         row=1,
         col=1,
     )
-    fig.update_yaxes(showgrid=True, gridcolor=grid, linecolor=fg, tickfont=dict(color=fg), title_font=dict(color=fg), row=1, col=1)
-    fig.update_yaxes(showgrid=True, gridcolor=grid, linecolor=fg, tickfont=dict(color=fg), title_font=dict(color=fg), row=2, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor=grid, linecolor=fg, tickfont=dict(color=fg, size=12), title_font=dict(color=fg, size=12), row=1, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor=grid, linecolor=fg, tickfont=dict(color=fg, size=12), title_font=dict(color=fg, size=12), row=2, col=1)
+    # Keep both panels locked together when the user pans/zooms vertically.
+    fig.update_yaxes(matches="y", row=2, col=1)
     fig.update_layout(
         height=600,
         margin=dict(l=60, r=90, t=40, b=120),
@@ -406,21 +477,76 @@ def _view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
                 len=0.35,
                 tickvals=b_tickvals,
                 ticktext=b_ticktext,
-                tickfont=dict(color=fg),
+                tickfont=dict(color=fg, size=12),
             ),
         ),
         coloraxis2=dict(
             colorscale="Viridis",
             cmin=lmin,
             cmax=lmax,
-            colorbar=dict(title="", x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg)),
+            colorbar=dict(title="", x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg, size=12)),
         ),
         paper_bgcolor=bg,
         plot_bgcolor=bg,
-        font=dict(color=fg),
+        font=dict(color=fg, size=13),
         annotations=tuple(list(fig.layout.annotations) + noon_annots),
     )
-    return pn.pane.Plotly(fig, config={"responsive": True}, sizing_mode="stretch_both")
+    plot_pane.object = fig
+
+
+def _parse_relayout_time(val):
+    """Parse plotly relayout timestamps safely."""
+    try:
+        return pd.to_datetime(val).to_pydatetime()
+    except Exception:
+        return None
+
+
+def _on_relayout(event):
+    """When the user zooms/pans, sync controls (and disable live) so we reload data at higher detail."""
+    global _relayout_guard
+    if _relayout_guard:
+        return
+    data = event.new or {}
+    x0 = data.get("xaxis.range[0]")
+    x1 = data.get("xaxis.range[1]")
+    start = _parse_relayout_time(x0) if x0 is not None else None
+    end = _parse_relayout_time(x1) if x1 is not None else None
+    if start is not None and end is not None and start > end:
+        start, end = end, start
+    y0 = data.get("yaxis.range[0]") or data.get("yaxis2.range[0]")
+    y1 = data.get("yaxis.range[1]") or data.get("yaxis2.range[1]")
+    if y0 is not None and y1 is not None and y0 > y1:
+        y0, y1 = y1, y0
+    if start is None and end is None and y0 is None and y1 is None:
+        return
+    _relayout_guard = True
+    try:
+        _set_live(False)
+        if start is not None and end is not None:
+            range_start.value = start
+            range_end.value = end
+        if y0 is not None and y1 is not None:
+            low = max(float(y0), 0.0)
+            high = max(float(y1), low + 100.0)
+            bottom_range_m.value = int(low)
+            top_range_m.value = int(high)
+    finally:
+        _relayout_guard = False
+
+
+plot_pane.param.watch(_on_relayout, "relayout_data")
+# Initial render
+_update_view(
+    range_start.value,
+    range_end.value,
+    bottom_range_m.value,
+    top_range_m.value,
+    beta_vmin.value,
+    beta_vmax.value,
+    ldr_vmin.value,
+    ldr_vmax.value,
+)
 
 
 # -------- Calendar quicklooks --------
@@ -485,6 +611,19 @@ def _shift_ql(delta: int):
 ql_prev.on_click(lambda _e: _shift_ql(-1))
 ql_next.on_click(lambda _e: _shift_ql(1))
 
+# Periodically refresh the "Today (latest)" selection to pick up new PNGs.
+def _refresh_latest_if_needed():
+    """If viewing the latest image, reload the mapping and redraw without changing selection."""
+    if ql_date.value == "Today (latest)":
+        # Update the cached map so _quicklook_image sees fresh file paths,
+        # but do not touch the selector options to avoid snapping UI.
+        global _ql_options
+        _ql_options = _quicklook_options()
+        ql_date.param.trigger("value")
+
+
+_ql_timer = pn.state.add_periodic_callback(_refresh_latest_if_needed, period=60_000, start=True)
+
 # Ensure initial map is fresh
 _refresh_ql_options(preserve_current=True)
 
@@ -503,6 +642,7 @@ css = """
 # Global font override for a clean, consistent look.
 body, .bk {
     font-family: "SF Pro Display","SF Pro","-apple-system","BlinkMacSystemFont","Segoe UI",sans-serif;
+    font-size: 15px;
 }
 """
 
@@ -529,7 +669,7 @@ template = pn.template.MaterialTemplate(
     header_color="white",
 )
 
-interactive_tab = pn.Column(controls, _view, sizing_mode="stretch_both")
+interactive_tab = pn.Column(controls, plot_pane, sizing_mode="stretch_both")
 tabs = pn.Tabs(
     ("Interactive", interactive_tab),
     (
