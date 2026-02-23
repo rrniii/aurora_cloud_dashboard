@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Render the last 24 hours of cloud radar data (Chirp 1) to a PNG for the dashboard.
-Two panels: C1ZE (log-scaled) and C1MeanVel.
+Render the last 24 hours of cloud radar data to a multi-panel PNG for the dashboard.
+Panels (top→bottom): ZE_dBZ, MeanVel, SpecWidth, SLDR, RHV, SRCX, Skew, Kurt.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from datetime import timedelta
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
 from matplotlib.dates import DateFormatter, HourLocator
 import numpy as np
 import pandas as pd
@@ -20,19 +19,24 @@ import xarray as xr
 ZARR_DEFAULT = Path("/mnt/data/ass/rpgfmcw94/cloud_radar.zarr")
 OUTPUT_DEFAULT = Path("last24h_cloudradar.png")
 
-ZE_VMIN = -30.0
-ZE_VMAX = 10.0
-VEL_VMIN = -5.0
-VEL_VMAX = 5.0
+# Limits aligned with dashboard defaults
+ZE_VMIN, ZE_VMAX = -30.0, 10.0
+VEL_VMIN, VEL_VMAX = -5.0, 5.0
+SPEC_VMIN, SPEC_VMAX = 0.0, 3.0
+SLDR_VMIN, SLDR_VMAX = -100.0, -10.0
+RHV_VMIN, RHV_VMAX = 0.8, 1.0
+SRCX_VMIN, SRCX_VMAX = 0.8, 1.0
+SKEW_VMIN, SKEW_VMAX = -2.0, 2.0
+KURT_VMIN, KURT_VMAX = 0.0, 8.0
 RANGE_MAX = 9000
 
 
 def plot_last_24h(zarr_path: Path, output: Path):
     ds = xr.open_zarr(zarr_path, chunks={})
-    if "time" not in ds:
-        raise KeyError("Dataset missing time coordinate")
-    if "ZE_dBZ" not in ds or "MeanVel" not in ds:
-        raise KeyError("Dataset missing ZE_dBZ or MeanVel")
+    needed = ["ZE_dBZ", "MeanVel", "SpecWidth", "SLDR", "RHV", "SRCX", "Skew", "Kurt"]
+    missing = [v for v in needed if v not in ds]
+    if missing:
+        raise KeyError(f"Dataset missing variables: {', '.join(missing)}")
 
     time_index = pd.DatetimeIndex(ds["time"].values)
     end_time = pd.Timestamp.utcnow().replace(tzinfo=None)
@@ -44,13 +48,19 @@ def plot_last_24h(zarr_path: Path, output: Path):
     window = ds.isel(time=mask).sortby("time")
     window = window.sel({"range": slice(0, RANGE_MAX)})
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, sharey=True)
+    fig, axes = plt.subplots(8, 1, figsize=(12, 20), sharex=True, sharey=True)
     vars_titles = [
-        ("ZE_dBZ", "ZE (dBZ)", ZE_VMIN, ZE_VMAX, "ZE (dBZ)", "cividis", "linear"),
-        ("MeanVel", "Mean Velocity", VEL_VMIN, VEL_VMAX, "Velocity (m/s)", "RdBu_r", "linear"),
+        ("ZE_dBZ", "ZE (dBZ)", ZE_VMIN, ZE_VMAX, "ZE (dBZ)", "cividis"),
+        ("MeanVel", "Mean Velocity", VEL_VMIN, VEL_VMAX, "Velocity (m/s)", "RdBu_r"),
+        ("SpecWidth", "Spectrum Width (m/s)", SPEC_VMIN, SPEC_VMAX, "Spec Width (m/s)", "plasma"),
+        ("SLDR", "SLDR (dB)", SLDR_VMIN, SLDR_VMAX, "SLDR (dB)", "RdBu_r"),
+        ("RHV", "RHV", RHV_VMIN, RHV_VMAX, "RHV", "viridis"),
+        ("SRCX", "SRCX", SRCX_VMIN, SRCX_VMAX, "SRCX", "viridis"),
+        ("Skew", "Skew", SKEW_VMIN, SKEW_VMAX, "Skew", "RdBu_r"),
+        ("Kurt", "Kurtosis", KURT_VMIN, KURT_VMAX, "Kurtosis", "magma"),
     ]
 
-    for ax, (var, title, vmin, vmax, cbar_label, cmap, scale) in zip(axes, vars_titles):
+    for ax, (var, title, vmin, vmax, cbar_label, cmap) in zip(axes, vars_titles):
         da = window[var]
         data = da.transpose("time", "range").values
         mesh = ax.pcolormesh(
@@ -82,7 +92,7 @@ def plot_last_24h(zarr_path: Path, output: Path):
 
     fig.suptitle("Cloud Radar – Last 24 hours")
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.22)
+    fig.subplots_adjust(bottom=0.22, hspace=0.18)
     fig.savefig(output, dpi=150)
     print(f"Wrote {output}")
 

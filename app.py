@@ -51,11 +51,11 @@ INSTRUMENTS = {
             "ZDR": {"label": "ZDR (dB)", "clim": (-10.0, 6.0), "log": False, "colorscale": "RdBu_r"},
             "SRCX": {"label": "SRCX", "clim": (0.0, 1.0), "log": False, "colorscale": "Viridis"},
             "SpecWidth": {"label": "Spectrum Width (m/s)", "clim": (0.0, 3.0), "log": False, "colorscale": "Plasma"},
-            "SLDR": {"label": "SLDR (dB)", "clim": (-30.0, 10.0), "log": False, "colorscale": "RdBu_r"},
+            "SLDR": {"label": "SLDR (dB)", "clim": (-100.0, -10.0), "log": False, "colorscale": "RdBu_r"},
             "Skew": {"label": "Skew", "clim": (-2.0, 2.0), "log": False, "colorscale": "RdBu_r"},
-            "RHV": {"label": "RHV", "clim": (0.0, 1.0), "log": False, "colorscale": "Viridis"},
+            "RHV": {"label": "RHV", "clim": (0.8, 1.0), "log": False, "colorscale": "Viridis"},
             "PhiDP": {"label": "PhiDP (rad)", "clim": (-2.0, 2.0), "log": False, "colorscale": "RdBu_r"},
-            "Kurt": {"label": "Kurtosis", "clim": (0.0, 10.0), "log": False, "colorscale": "Magma"},
+            "Kurt": {"label": "Kurtosis", "clim": (0.0, 8.0), "log": False, "colorscale": "Magma"},
             "KDP": {"label": "KDP (rad/km)", "clim": (-4.0, 4.0), "log": False, "colorscale": "RdBu_r"},
             "DiffAtt": {"label": "Differential Attenuation (dB/km)", "clim": (-5.0, 5.0), "log": False, "colorscale": "RdBu_r"},
         },
@@ -813,7 +813,7 @@ def _quicklook_image(selected):
     # Use the latest map in case files changed since last refresh.
     path = _quicklook_options().get(selected)
     if path and Path(path).exists():
-        return pn.pane.PNG(path, sizing_mode="stretch_both")
+        return pn.pane.PNG(path, sizing_mode="stretch_width", height=2500)
     return pn.pane.Markdown("No image available for this selection.")
 
 

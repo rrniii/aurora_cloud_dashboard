@@ -22,6 +22,18 @@ ZE_VMIN = -30.0
 ZE_VMAX = 10.0
 VEL_VMIN = -5.0
 VEL_VMAX = 5.0
+SPEC_VMIN = 0.0
+SPEC_VMAX = 3.0
+SLDR_VMIN = -100.0
+SLDR_VMAX = -10.0
+RHV_VMIN = 0.8
+RHV_VMAX = 1.0
+SRCX_VMIN = 0.8
+SRCX_VMAX = 1.0
+SKEW_VMIN = -2.0
+SKEW_VMAX = 2.0
+KURT_VMIN = 0.0
+KURT_VMAX = 8.0
 RANGE_MAX = 9000
 
 
@@ -34,6 +46,12 @@ def _plot_day(ds_day: xr.Dataset, date_label: str, output: Path) -> None:
     vars_titles = [
         ("ZE_dBZ", "ZE (dBZ)", ZE_VMIN, ZE_VMAX, "ZE (dBZ)", "cividis", "linear"),
         ("MeanVel", "Mean Velocity", VEL_VMIN, VEL_VMAX, "Velocity (m/s)", "RdBu_r", "linear"),
+        ("SpecWidth", "Spectrum Width (m/s)", SPEC_VMIN, SPEC_VMAX, "Spec Width (m/s)", "plasma", "linear"),
+        ("SLDR", "SLDR (dB)", SLDR_VMIN, SLDR_VMAX, "SLDR (dB)", "RdBu_r", "linear"),
+        ("RHV", "RHV", RHV_VMIN, RHV_VMAX, "RHV", "viridis", "linear"),
+        ("SRCX", "SRCX", SRCX_VMIN, SRCX_VMAX, "SRCX", "viridis", "linear"),
+        ("Skew", "Skew", SKEW_VMIN, SKEW_VMAX, "Skew", "RdBu_r", "linear"),
+        ("Kurt", "Kurtosis", KURT_VMIN, KURT_VMAX, "Kurtosis", "magma", "linear"),
     ]
 
     for ax, (var, title, vmin, vmax, cbar_label, cmap, scale) in zip(axes, vars_titles):
