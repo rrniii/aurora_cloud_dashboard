@@ -51,28 +51,57 @@ def _list_nc_files(root: Path, start_dt: datetime) -> List[Path]:
     return [p for _, p in files]
 
 
+def _combine_chirps(raw: xr.Dataset):
+    """Combine chirp 1 and chirp 2 along range, using C1 time axis."""
+    required = ["C1Range", "C2Range", "C1ZE", "C2ZE", "C1MeanVel", "C2MeanVel"]
+    for r in required:
+        if r not in raw:
+            raise KeyError(f"Missing {r} in file")
+
+    r1 = raw["C1Range"].values
+    r2 = raw["C2Range"].values
+    ranges = np.concatenate([r1, r2])
+
+    t_len = raw["C1ZE"].sizes["Time"]
+    r_len = len(ranges)
+    ze = np.full((t_len, r_len), np.nan, dtype=np.float32)
+    vel = np.full((t_len, r_len), np.nan, dtype=np.float32)
+
+    ze[:, : len(r1)] = raw["C1ZE"].values
+    ze[:, len(r1) :] = raw["C2ZE"].values
+    vel[:, : len(r1)] = raw["C1MeanVel"].values
+    vel[:, len(r1) :] = raw["C2MeanVel"].values
+
+    return ranges, ze, vel
+
+
+def _to_dbz(linear):
+    linear = np.where(linear > 0, linear, np.nan)
+    with np.errstate(divide="ignore"):
+        dbz = 10.0 * np.log10(linear)
+    return dbz.astype(np.float32)
+
+
 def _load_nc(path: Path) -> xr.Dataset:
     raw = xr.open_dataset(path, decode_times=False)
-    if "Time" not in raw or "C1Range" not in raw:
-        raise KeyError(f"Missing Time or C1Range in {path}")
+    if "Time" not in raw:
+        raise KeyError(f"Missing Time in {path}")
     base = TIME_ZERO
     time = base + raw["Time"].astype("timedelta64[s]") + raw["Timems"].astype("timedelta64[ms]")
     time_vals = np.array(time.values)
-    range_da = raw["C1Range"].rename({"C1Range": "range"})
 
-    def _to_dbz(da: xr.DataArray) -> xr.DataArray:
-        da = da.astype("float32").where(da > 0)
-        return 10.0 * np.log10(da)
+    ranges, ze_lin, vel_lin = _combine_chirps(raw)
+    ze_dbz = _to_dbz(ze_lin)
+    vel = np.where(vel_lin > -900, vel_lin, np.nan).astype(np.float32)
 
-    ze_dbz = _to_dbz(raw["C1ZE"]).rename({"Time": "time", "C1Range": "range"})
-    sldr_db = raw["C1SLDR"].astype("float32").rename({"Time": "time", "C1Range": "range"})
-
-    ze_dbz = ze_dbz.assign_coords(time=("time", time_vals), range=("range", range_da.values))
-    sldr_db = sldr_db.assign_coords(time=("time", time_vals), range=("range", range_da.values))
-
-    ds = xr.Dataset({"ze_dbz": ze_dbz, "sldr_db": sldr_db})
-    ds = ds.sortby("time")
-    return ds
+    ds = xr.Dataset(
+        {
+            "ZE_dBZ": (("time", "range"), ze_dbz),
+            "MeanVel": (("time", "range"), vel),
+        },
+        coords={"time": time_vals, "range": ranges},
+    )
+    return ds.sortby("time")
 
 
 def build_zarr(root: Path, output: Path, start_dt: datetime, chunks: dict | str | None = None):

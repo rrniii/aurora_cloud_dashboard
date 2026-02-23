@@ -54,17 +54,35 @@ def _load_nc(path: Path) -> xr.Dataset:
     time = base + raw["Time"].astype("timedelta64[s]") + raw["Timems"].astype("timedelta64[ms]")
     time_vals = np.array(time.values)
 
-    def _to_dbz(da: xr.DataArray) -> xr.DataArray:
-        da = da.astype("float32").where(da > 0)
-        return 10.0 * np.log10(da)
+    required = ["C1Range", "C2Range", "C1ZE", "C2ZE", "C1MeanVel", "C2MeanVel"]
+    for r in required:
+        if r not in raw:
+            raise KeyError(f"Missing {r} in {path}")
 
-    range_da = raw["C1Range"].rename({"C1Range": "range"})
-    ze_dbz = _to_dbz(raw["C1ZE"]).rename({"Time": "time", "C1Range": "range"})
-    sldr_db = raw["C1SLDR"].astype("float32").rename({"Time": "time", "C1Range": "range"})
+    r1 = raw["C1Range"].values
+    r2 = raw["C2Range"].values
+    ranges = np.concatenate([r1, r2])
 
-    ze_dbz = ze_dbz.assign_coords(time=("time", time_vals), range=("range", range_da.values))
-    sldr_db = sldr_db.assign_coords(time=("time", time_vals), range=("range", range_da.values))
-    ds = xr.Dataset({"ze_dbz": ze_dbz, "sldr_db": sldr_db})
+    t_len = raw["C1ZE"].sizes["Time"]
+    ze_lin = np.full((t_len, len(ranges)), np.nan, dtype=np.float32)
+    vel_lin = np.full_like(ze_lin, np.nan)
+    ze_lin[:, : len(r1)] = raw["C1ZE"].values
+    ze_lin[:, len(r1) :] = raw["C2ZE"].values
+    vel_lin[:, : len(r1)] = raw["C1MeanVel"].values
+    vel_lin[:, len(r1) :] = raw["C2MeanVel"].values
+
+    ze_lin = np.where(ze_lin > 0, ze_lin, np.nan)
+    with np.errstate(divide="ignore"):
+        ze_dbz = 10.0 * np.log10(ze_lin)
+    vel = np.where(vel_lin > -900, vel_lin, np.nan).astype(np.float32)
+
+    ds = xr.Dataset(
+        {
+            "ZE_dBZ": (("time", "range"), ze_dbz.astype(np.float32)),
+            "MeanVel": (("time", "range"), vel),
+        },
+        coords={"time": time_vals, "range": ranges},
+    )
     return ds.sortby("time")
 
 

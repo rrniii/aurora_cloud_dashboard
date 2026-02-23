@@ -38,10 +38,10 @@ INSTRUMENTS = {
         "zarr_default": "/mnt/data/ass/rpgfmcw94/cloud_radar.zarr",
         "chunk_spec": {"time": 400},
         "consolidated": True,
-        "height_load_max": 12_000,
-        "top_range_default": 12_000,
-        "var1": {"name": "ze_dbz", "label": "Reflectivity (dBZ)", "clim": (-40.0, 20.0), "log": False, "colorscale": "Cividis"},
-        "var2": {"name": "sldr_db", "label": "SLDR (dB)", "clim": (-30.0, 10.0), "log": False, "colorscale": "Viridis"},
+        "height_load_max": 9_000,
+        "top_range_default": 9_000,
+        "var1": {"name": "ZE_dBZ", "label": "C1+C2 ZE (dBZ)", "clim": (-30.0, 10.0), "log": False, "colorscale": "Cividis"},
+        "var2": {"name": "MeanVel", "label": "C1+C2 Mean Velocity (m/s)", "clim": (-5.0, 5.0), "log": False, "colorscale": "RdBu_r"},
         "quicklook_dir": Path("/home/aurora/aurora_cloud_dashboard/quicklooks/cloud_radar"),
         "latest_image": Path("/home/aurora/aurora_cloud_dashboard/last24h_cloudradar.png"),
     },
@@ -237,7 +237,6 @@ next_btn = pn.widgets.Button(name="Next Day/Current Day", button_type="default")
 live_toggle = pn.widgets.Toggle(name="Live Update (Last 24h)", button_type="primary", value=True)
 instrument_select = pn.widgets.Select(name="Instrument", value=CURRENT_INSTRUMENT, options=list(INSTRUMENTS.keys()))
 calendar_instrument = pn.widgets.Select(name="Instrument", value=CURRENT_INSTRUMENT, options=list(INSTRUMENTS.keys()))
-calendar_instrument.disabled = True
 
 _live_guard = False
 _instrument_guard = False
@@ -288,6 +287,8 @@ def _apply_instrument_defaults(inst: str, reset_time: bool = True):
         _set_live(True)
 
     _refresh_ql_options(preserve_current=False)
+    # Force quicklook pane refresh even if selection string didn't change
+    ql_date.param.trigger("value")
     _instrument_guard = False
 
 
@@ -337,6 +338,16 @@ def _on_instrument_change(event):
 
 
 instrument_select.param.watch(_on_instrument_change, "value")
+
+
+def _on_calendar_instrument_change(event):
+    """Sync calendar instrument dropdown back to the main instrument selector."""
+    if _instrument_guard:
+        return
+    instrument_select.value = event.new
+
+
+calendar_instrument.param.watch(_on_calendar_instrument_change, "value")
 
 def _auto_refresh():
     """Periodic refresh when live mode is on."""
@@ -738,7 +749,7 @@ def _refresh_latest_if_needed():
         ql_date.param.trigger("value")
 
 
-_ql_timer = pn.state.add_periodic_callback(_refresh_latest_if_needed, period=60_000, start=True)
+_ql_timer = pn.state.add_periodic_callback(_refresh_latest_if_needed, period=15_000, start=True)
 
 # Ensure initial map is fresh
 _refresh_ql_options(preserve_current=True)

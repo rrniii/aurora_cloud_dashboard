@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate daily quicklook PNGs for the cloud radar Zarr store.
-One PNG per day (00:00–23:59 UTC) with reflectivity and SLDR panels.
+One PNG per day (00:00–23:59 UTC) with C1ZE (log) and C1MeanVel panels.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from matplotlib.dates import DateFormatter, HourLocator
 import numpy as np
 import pandas as pd
@@ -17,11 +18,11 @@ import xarray as xr
 
 ZARR_PATH = Path("/mnt/data/ass/rpgfmcw94/cloud_radar.zarr")
 QUICKLOOK_DIR = Path("/home/aurora/aurora_cloud_dashboard/quicklooks/cloud_radar")
-REFL_VMIN = -40
-REFL_VMAX = 20
-SLDR_VMIN = -30
-SLDR_VMAX = 10
-RANGE_MAX = 12000
+ZE_VMIN = -30.0
+ZE_VMAX = 10.0
+VEL_VMIN = -5.0
+VEL_VMAX = 5.0
+RANGE_MAX = 9000
 
 
 def _ensure_dir(path: Path) -> None:
@@ -31,11 +32,11 @@ def _ensure_dir(path: Path) -> None:
 def _plot_day(ds_day: xr.Dataset, date_label: str, output: Path) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, sharey=True)
     vars_titles = [
-        ("ze_dbz", "Reflectivity (dBZ)", REFL_VMIN, REFL_VMAX, "Reflectivity (dBZ)"),
-        ("sldr_db", "SLDR (dB)", SLDR_VMIN, SLDR_VMAX, "SLDR (dB)"),
+        ("ZE_dBZ", "ZE (dBZ)", ZE_VMIN, ZE_VMAX, "ZE (dBZ)", "cividis", "linear"),
+        ("MeanVel", "Mean Velocity", VEL_VMIN, VEL_VMAX, "Velocity (m/s)", "RdBu_r", "linear"),
     ]
 
-    for ax, (var, title, vmin, vmax, cbar_label) in zip(axes, vars_titles):
+    for ax, (var, title, vmin, vmax, cbar_label, cmap, scale) in zip(axes, vars_titles):
         da = ds_day[var].transpose("time", "range")
         data = da.values
         mesh = ax.pcolormesh(
@@ -45,7 +46,7 @@ def _plot_day(ds_day: xr.Dataset, date_label: str, output: Path) -> None:
             shading="auto",
             vmin=vmin,
             vmax=vmax,
-            cmap="cividis" if var == "ze_dbz" else "viridis",
+            cmap=cmap,
         )
         cbar = fig.colorbar(mesh, ax=ax, pad=0.01)
         cbar.set_label(cbar_label)
@@ -78,8 +79,8 @@ def main(force: bool = False):
     ds = xr.open_zarr(ZARR_PATH, chunks={})
     if "time" not in ds:
         raise KeyError("Dataset missing time coordinate")
-    if "ze_dbz" not in ds or "sldr_db" not in ds:
-        raise KeyError("Dataset missing ze_dbz or sldr_db")
+    if "ZE_dBZ" not in ds or "MeanVel" not in ds:
+        raise KeyError("Dataset missing ZE_dBZ or MeanVel")
 
     time_index = pd.DatetimeIndex(ds["time"].values)
     today = pd.Timestamp.utcnow().replace(tzinfo=None).date()

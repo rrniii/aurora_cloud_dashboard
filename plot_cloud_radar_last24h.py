@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Render the last 24 hours of cloud radar data (Chirp 1) to a PNG for the dashboard.
-Produces two stacked panels: reflectivity (dBZ) and slanted LDR (dB).
+Two panels: C1ZE (log-scaled) and C1MeanVel.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from matplotlib.dates import DateFormatter, HourLocator
 import numpy as np
 import pandas as pd
@@ -19,19 +20,19 @@ import xarray as xr
 ZARR_DEFAULT = Path("/mnt/data/ass/rpgfmcw94/cloud_radar.zarr")
 OUTPUT_DEFAULT = Path("last24h_cloudradar.png")
 
-REFL_VMIN = -40
-REFL_VMAX = 20
-SLDR_VMIN = -30
-SLDR_VMAX = 10
-RANGE_MAX = 12000
+ZE_VMIN = -30.0
+ZE_VMAX = 10.0
+VEL_VMIN = -5.0
+VEL_VMAX = 5.0
+RANGE_MAX = 9000
 
 
 def plot_last_24h(zarr_path: Path, output: Path):
     ds = xr.open_zarr(zarr_path, chunks={})
     if "time" not in ds:
         raise KeyError("Dataset missing time coordinate")
-    if "ze_dbz" not in ds or "sldr_db" not in ds:
-        raise KeyError("Dataset missing ze_dbz or sldr_db")
+    if "ZE_dBZ" not in ds or "MeanVel" not in ds:
+        raise KeyError("Dataset missing ZE_dBZ or MeanVel")
 
     time_index = pd.DatetimeIndex(ds["time"].values)
     end_time = pd.Timestamp.utcnow().replace(tzinfo=None)
@@ -45,11 +46,11 @@ def plot_last_24h(zarr_path: Path, output: Path):
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, sharey=True)
     vars_titles = [
-        ("ze_dbz", "Reflectivity (dBZ)", REFL_VMIN, REFL_VMAX, "Spectral Reflectivity"),
-        ("sldr_db", "SLDR (dB)", SLDR_VMIN, SLDR_VMAX, "Slanted LDR"),
+        ("ZE_dBZ", "ZE (dBZ)", ZE_VMIN, ZE_VMAX, "ZE (dBZ)", "cividis", "linear"),
+        ("MeanVel", "Mean Velocity", VEL_VMIN, VEL_VMAX, "Velocity (m/s)", "RdBu_r", "linear"),
     ]
 
-    for ax, (var, title, vmin, vmax, cbar_label) in zip(axes, vars_titles):
+    for ax, (var, title, vmin, vmax, cbar_label, cmap, scale) in zip(axes, vars_titles):
         da = window[var]
         data = da.transpose("time", "range").values
         mesh = ax.pcolormesh(
@@ -59,7 +60,7 @@ def plot_last_24h(zarr_path: Path, output: Path):
             shading="auto",
             vmin=vmin,
             vmax=vmax,
-            cmap="cividis" if var == "ze_dbz" else "viridis",
+            cmap=cmap,
         )
         ax.set_ylabel("range (m)")
         ax.set_title(title)
