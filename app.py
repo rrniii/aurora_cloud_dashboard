@@ -20,26 +20,51 @@ import xarray as xr
 pn.extension("plotly", notifications=True, sizing_mode="stretch_width")
 
 # --- Configuration ---
-ZARR_PATH = os.environ.get(
-    "CEILOMETER_ZARR_PATH",
-    "/mnt/data/cl61/gamb2le_depolarisation_lidar_ceilometer_aurora_20251201.zarr",
-)
-DEFAULT_CHUNK_SPEC = {"time": 600}
-ZARR_CONSOLIDATED = True
+INSTRUMENTS = {
+    "Ceilometer": {
+        "zarr_env": "CEILOMETER_ZARR_PATH",
+        "zarr_default": "/mnt/data/cl61/gamb2le_depolarisation_lidar_ceilometer_aurora_20251201.zarr",
+        "chunk_spec": {"time": 600},
+        "consolidated": True,
+        "height_load_max": 10_000,
+        "top_range_default": 8000,
+        "var1": {"name": "beta_att", "label": "Attenuated Backscatter", "clim": (1e-7, 1e-4), "log": True, "colorscale": "Cividis"},
+        "var2": {"name": "linear_depol_ratio", "label": "Linear Depolarization Ratio", "clim": (0.0, 0.5), "log": False, "colorscale": "Viridis"},
+        "quicklook_dir": Path("/home/aurora/aurora_cloud_dashboard/quicklooks/ceilometer"),
+        "latest_image": Path("/home/aurora/aurora_cloud_dashboard/last24h.png"),
+    },
+    "Cloud Radar": {
+        "zarr_env": "CLOUD_RADAR_ZARR_PATH",
+        "zarr_default": "/mnt/data/ass/rpgfmcw94/cloud_radar.zarr",
+        "chunk_spec": {"time": 400},
+        "consolidated": True,
+        "height_load_max": 12_000,
+        "top_range_default": 12_000,
+        "var1": {"name": "ze_dbz", "label": "Reflectivity (dBZ)", "clim": (-40.0, 20.0), "log": False, "colorscale": "Cividis"},
+        "var2": {"name": "sldr_db", "label": "SLDR (dB)", "clim": (-30.0, 10.0), "log": False, "colorscale": "Viridis"},
+        "quicklook_dir": Path("/home/aurora/aurora_cloud_dashboard/quicklooks/cloud_radar"),
+        "latest_image": Path("/home/aurora/aurora_cloud_dashboard/last24h_cloudradar.png"),
+    },
+}
+
 DEFAULT_WINDOW = timedelta(hours=24)
 LIVE_REFRESH_MS = 60_000  # how often to snap to latest when live is on (ms)
-HEIGHT_LOAD_MAX_M = 10_000  # drop range samples above this
 TIME_SUBSAMPLE = 2  # slice time to lighten payloads
 TIME_TARGET = 300  # target max time samples for plotting
 HEIGHT_TARGET = 200  # target max height samples for plotting
-TOP_RANGE_DEFAULT = 8000
-BETA_CLIM = (1e-7, 1e-4)
-LDR_CLIM = (0.0, 0.5)
-LATEST_IMAGE = Path("/home/aurora/aurora_cloud_dashboard/last24h.png")
-QUICKLOOK_DIR = Path("/home/aurora/aurora_cloud_dashboard/quicklooks/ceilometer")
-
-_BASE_DS = None
 DATA_REFRESH_MS = 300_000  # reload base dataset every 5 minutes
+
+_BASE_DS: dict[str, xr.Dataset | None] = {}
+CURRENT_INSTRUMENT = "Ceilometer"
+
+
+def _cfg():
+    return INSTRUMENTS[CURRENT_INSTRUMENT]
+
+
+def _zarr_path():
+    cfg = _cfg()
+    return os.environ.get(cfg["zarr_env"], cfg["zarr_default"])
 
 
 def _ensure_utc(dt):
@@ -53,22 +78,24 @@ def _ensure_utc(dt):
 
 
 def _get_base_dataset():
-    """Open the Zarr store (memoized) with configured chunks and consolidation."""
-    global _BASE_DS
-    if _BASE_DS is not None:
-        return _BASE_DS
+    """Open the Zarr store (memoized per instrument) with configured chunks and consolidation."""
+    inst = CURRENT_INSTRUMENT
+    if inst in _BASE_DS and _BASE_DS[inst] is not None:
+        return _BASE_DS[inst]
+    cfg = _cfg()
+    zarr_path = _zarr_path()
     try:
-        ds = xr.open_zarr(ZARR_PATH, chunks=DEFAULT_CHUNK_SPEC, consolidated=ZARR_CONSOLIDATED)
+        ds = xr.open_zarr(zarr_path, chunks=cfg["chunk_spec"], consolidated=cfg["consolidated"])
     except Exception:
-        ds = xr.open_zarr(ZARR_PATH, chunks="auto", consolidated=False)
-    _BASE_DS = ds
+        ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=False)
+    _BASE_DS[inst] = ds
     return ds
 
 
 def _refresh_base_dataset():
     """Drop the cached dataset so the next access reopens the Zarr (captures new data)."""
-    global _BASE_DS
-    _BASE_DS = None
+    inst = CURRENT_INSTRUMENT
+    _BASE_DS[inst] = None
 
 
 def _median_filter_nan(arr, k=3):
@@ -118,6 +145,7 @@ def _coarsen_targets(duration: timedelta | None, height_span: float | None):
 
 def open_window(t0, t1, bottom_m=None, top_m=None):
     """Slice the base dataset, adapt coarsening to window span, and filter height."""
+    cfg = _cfg()
     t0 = _ensure_utc(t0)
     t1 = _ensure_utc(t1)
     if t0 is None or t1 is None or t0 >= t1:
@@ -126,7 +154,7 @@ def open_window(t0, t1, bottom_m=None, top_m=None):
     height_span = None
     if bottom_m is not None or top_m is not None:
         b = max(bottom_m or 0.0, 0.0)
-        t = top_m if top_m is not None else HEIGHT_LOAD_MAX_M
+        t = top_m if top_m is not None else cfg["height_load_max"]
         height_span = max(t - b, 0.0)
     time_subsample, time_target, height_target = _coarsen_targets(duration, height_span)
     base = _get_base_dataset()
@@ -142,14 +170,14 @@ def open_window(t0, t1, bottom_m=None, top_m=None):
     except Exception:
         ds = base
     try:
-        ds = ds.sel({"range": slice(0, HEIGHT_LOAD_MAX_M)})
+        ds = ds.sel({"range": slice(0, cfg["height_load_max"])})
     except Exception:
-        ds = ds.where(ds["range"] <= HEIGHT_LOAD_MAX_M, drop=True)
+        ds = ds.where(ds["range"] <= cfg["height_load_max"], drop=True)
     # If the user narrowed the plotted range, trim the data before coarsening so
     # we keep more vertical detail within the zoomed band.
     if bottom_m is not None or top_m is not None:
         low = max(bottom_m or 0.0, 0.0)
-        high = min(top_m or HEIGHT_LOAD_MAX_M, HEIGHT_LOAD_MAX_M)
+        high = min(top_m or cfg["height_load_max"], cfg["height_load_max"])
         try:
             ds = ds.sel({"range": slice(low, high)})
         except Exception:
@@ -198,22 +226,69 @@ default_end = tmax or datetime.utcnow()
 default_start = default_end - DEFAULT_WINDOW
 range_start = pn.widgets.DatetimePicker(name="Start (UTC)", value=default_start)
 range_end = pn.widgets.DatetimePicker(name="End (UTC)", value=default_end)
-top_range_m = pn.widgets.IntInput(name="Top range (m)", value=TOP_RANGE_DEFAULT, step=100, start=500)
+top_range_m = pn.widgets.IntInput(name="Top range (m)", value=_cfg()["top_range_default"], step=100, start=500)
 bottom_range_m = pn.widgets.IntInput(name="Bottom range (m)", value=0, step=100, start=0)
-beta_vmin = pn.widgets.FloatInput(name="β min", value=BETA_CLIM[0], step=1e-7, format="0.000000e+00")
-beta_vmax = pn.widgets.FloatInput(name="β max", value=BETA_CLIM[1], step=1e-6, format="0.000000e+00")
-ldr_vmin = pn.widgets.FloatInput(name="LDR min", value=LDR_CLIM[0], step=0.05)
-ldr_vmax = pn.widgets.FloatInput(name="LDR max", value=LDR_CLIM[1], step=0.05)
+beta_vmin = pn.widgets.FloatInput(name="Var1 min", value=_cfg()["var1"]["clim"][0], step=0.1)
+beta_vmax = pn.widgets.FloatInput(name="Var1 max", value=_cfg()["var1"]["clim"][1], step=0.1)
+ldr_vmin = pn.widgets.FloatInput(name="Var2 min", value=_cfg()["var2"]["clim"][0], step=0.1)
+ldr_vmax = pn.widgets.FloatInput(name="Var2 max", value=_cfg()["var2"]["clim"][1], step=0.1)
 prev_btn = pn.widgets.Button(name="Previous Day", button_type="default")
 next_btn = pn.widgets.Button(name="Next Day/Current Day", button_type="default")
 live_toggle = pn.widgets.Toggle(name="Live Update (Last 24h)", button_type="primary", value=True)
-instrument_select = pn.widgets.Select(name="Instrument", value="Ceilometer", options=["Ceilometer"])
-calendar_instrument = pn.widgets.Select(name="Instrument", value="Ceilometer", options=["Ceilometer"])
+instrument_select = pn.widgets.Select(name="Instrument", value=CURRENT_INSTRUMENT, options=list(INSTRUMENTS.keys()))
+calendar_instrument = pn.widgets.Select(name="Instrument", value=CURRENT_INSTRUMENT, options=list(INSTRUMENTS.keys()))
+calendar_instrument.disabled = True
 
 _live_guard = False
+_instrument_guard = False
 _live_cb = None  # handle for periodic callback (used for live refresh)
 _relayout_guard = False  # prevents loops when syncing zoom back to widgets
 pn.state.add_periodic_callback(_refresh_base_dataset, period=DATA_REFRESH_MS, start=True)
+
+
+def _apply_instrument_defaults(inst: str, reset_time: bool = True):
+    """Switch instrument: refresh dataset cache, reset controls, and relabel color widgets."""
+    global CURRENT_INSTRUMENT, _instrument_guard
+    _instrument_guard = True
+    CURRENT_INSTRUMENT = inst
+    _refresh_base_dataset()
+    cfg = _cfg()
+
+    # Relabel color limit widgets
+    var1 = cfg["var1"]
+    var2 = cfg["var2"]
+    beta_vmin.name = f"{var1['label']} min"
+    beta_vmax.name = f"{var1['label']} max"
+    ldr_vmin.name = f"{var2['label']} min"
+    ldr_vmax.name = f"{var2['label']} max"
+
+    def _set_input(inp, vmin, vmax):
+        inp.value = vmin
+        # heuristic step
+        span = abs(vmax - vmin) or 1.0
+        inp.step = span / 100.0
+        inp.format = "0.000000e+00" if max(abs(vmin), abs(vmax)) < 1e-3 else None
+
+    _set_input(beta_vmin, var1["clim"][0], var1["clim"][1])
+    _set_input(beta_vmax, var1["clim"][1], var1["clim"][0])
+    _set_input(ldr_vmin, var2["clim"][0], var2["clim"][1])
+    _set_input(ldr_vmax, var2["clim"][1], var2["clim"][0])
+
+    bottom_range_m.value = 0
+    top_range_m.value = cfg["top_range_default"]
+
+    calendar_instrument.value = inst
+
+    if reset_time:
+        tmin, tmax = _dataset_time_bounds()
+        end = tmax or datetime.utcnow()
+        start = end - DEFAULT_WINDOW
+        range_start.value = start
+        range_end.value = end
+        _set_live(True)
+
+    _refresh_ql_options(preserve_current=False)
+    _instrument_guard = False
 
 
 def _refresh_to_latest(_event=None):
@@ -226,7 +301,7 @@ def _refresh_to_latest(_event=None):
     range_start.value = start
     range_end.value = end
     bottom_range_m.value = 0
-    top_range_m.value = TOP_RANGE_DEFAULT
+    top_range_m.value = _cfg()["top_range_default"]
     _live_guard = False
 
 
@@ -252,6 +327,17 @@ def _on_live_toggle(event):
 
 
 live_toggle.param.watch(_on_live_toggle, "value")
+
+
+def _on_instrument_change(event):
+    """Switch datasets and reset controls when instrument dropdown changes."""
+    if _instrument_guard:
+        return
+    _apply_instrument_defaults(event.new, reset_time=True)
+
+
+instrument_select.param.watch(_on_instrument_change, "value")
+
 def _auto_refresh():
     """Periodic refresh when live mode is on."""
     if live_toggle.value:
@@ -338,13 +424,17 @@ plot_pane = pn.pane.Plotly(config={"responsive": True}, sizing_mode="stretch_bot
     beta_vmax.param.value,
     ldr_vmin.param.value,
     ldr_vmax.param.value,
+    instrument_select.param.value,
     watch=True,
 )
-def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
+def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax, instrument):
     """Render both heatmaps for the current window and control values."""
     bottom = max(float(bottom_val), 0.0)
     top = max(float(top_val), bottom + 100.0)
     ds = open_window(start, end, bottom_m=bottom, top_m=top)
+    cfg = _cfg()
+    var1 = cfg["var1"]
+    var2 = cfg["var2"]
     # Simple light theme for plots
     bg = "white"
     fg = "#222222"
@@ -364,44 +454,66 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
         plot_pane.object = fig
         return
     # Colorbar configs
-    b_cmin = np.log10(bmin)
-    b_cmax = np.log10(bmax)
-    b_tickvals = list(range(int(np.floor(b_cmin)), int(np.ceil(b_cmax)) + 1))
-    sup = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
-    b_ticktext = [f"10{str(v).translate(sup)}" for v in b_tickvals]
+    if var1["log"]:
+        b_cmin = np.log10(bmin)
+        b_cmax = np.log10(bmax)
+        b_tickvals = list(range(int(np.floor(b_cmin)), int(np.ceil(b_cmax)) + 1))
+        sup = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
+        b_ticktext = [f"10{str(v).translate(sup)}" for v in b_tickvals]
+    else:
+        b_cmin, b_cmax = bmin, bmax
+        b_tickvals = None
+        b_ticktext = None
     fig = make_subplots(
         rows=2,
         cols=1,
         shared_xaxes=True,
         shared_yaxes=False,
         vertical_spacing=0.05,
-        subplot_titles=("Attenuated Backscatter", "Linear Depolarization Ratio"),
+        subplot_titles=(var1["label"], var2["label"]),
     )
-    if "beta_att" in ds:
-        fig.add_trace(_make_plot(ds, "beta_att", (bmin, bmax), True, coloraxis="coloraxis"), row=1, col=1)
-    if "linear_depol_ratio" in ds and "beta_att" in ds:
-        # Only plot depol where beta is above threshold.
-        times = pd.to_datetime(ds["time"].values)
-        heights = ds["range"].values
-        ldr = np.array(ds["linear_depol_ratio"].transpose("range", "time"))
-        beta_vals = np.array(ds["beta_att"].transpose("range", "time"))
-        # Filter implausible depol values outside [0, 1].
-        ldr = np.where((ldr >= 0.0) & (ldr <= 1.0), ldr, np.nan)
-        mask_threshold = 10 ** -6.5  # ~3.2e-7; below this we consider depol unreliable
-        ldr = np.where(beta_vals >= mask_threshold, ldr, np.nan)
-        fig.add_trace(
-            go.Heatmap(
-                x=times,
-                y=heights,
-                z=ldr,
-                zmin=lmin,
-                zmax=lmax,
-                coloraxis="coloraxis2",
-                showscale=False,
-            ),
-            row=2,
-            col=1,
-        )
+    if var1["name"] in ds:
+        fig.add_trace(_make_plot(ds, var1["name"], (bmin, bmax), var1["log"], coloraxis="coloraxis"), row=1, col=1)
+    if var2["name"] in ds:
+        if var1["name"] == "beta_att" and var2["name"] == "linear_depol_ratio" and "beta_att" in ds:
+            # Only plot depol where beta is above threshold.
+            times = pd.to_datetime(ds["time"].values)
+            heights = ds["range"].values
+            ldr = np.array(ds[var2["name"]].transpose("range", "time"))
+            beta_vals = np.array(ds["beta_att"].transpose("range", "time"))
+            ldr = np.where((ldr >= 0.0) & (ldr <= 1.0), ldr, np.nan)
+            mask_threshold = 10 ** -6.5
+            ldr = np.where(beta_vals >= mask_threshold, ldr, np.nan)
+            fig.add_trace(
+                go.Heatmap(
+                    x=times,
+                    y=heights,
+                    z=ldr,
+                    zmin=lmin,
+                    zmax=lmax,
+                    coloraxis="coloraxis2",
+                    showscale=False,
+                ),
+                row=2,
+                col=1,
+            )
+        else:
+            times = pd.to_datetime(ds["time"].values)
+            heights = ds["range"].values
+            ldr = np.array(ds[var2["name"]].transpose("range", "time"))
+            fig.add_trace(
+                go.Heatmap(
+                    x=times,
+                    y=heights,
+                    z=ldr,
+                    zmin=lmin,
+                    zmax=lmax,
+                    coloraxis="coloraxis2",
+                    showscale=False,
+                ),
+                row=2,
+                col=1,
+            )
     fig.update_yaxes(range=[bottom, top], title_text="Range (m)", row=1, col=1)
     fig.update_yaxes(range=[bottom, top], title_text="Range (m)", row=2, col=1)
     # Hourly ticks; add horizontal date annotations at 12:00.
@@ -467,11 +579,11 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
         height=600,
         margin=dict(l=60, r=90, t=40, b=120),
         coloraxis=dict(
-            colorscale="Cividis",
+            colorscale=var1["colorscale"],
             cmin=b_cmin,
             cmax=b_cmax,
             colorbar=dict(
-                title="",
+                title=var1["label"],
                 x=1.04,
                 y=0.77,
                 len=0.35,
@@ -481,10 +593,10 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax):
             ),
         ),
         coloraxis2=dict(
-            colorscale="Viridis",
+            colorscale=var2["colorscale"],
             cmin=lmin,
             cmax=lmax,
-            colorbar=dict(title="", x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg, size=12)),
+            colorbar=dict(title=var2["label"], x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg, size=12)),
         ),
         paper_bgcolor=bg,
         plot_bgcolor=bg,
@@ -546,6 +658,7 @@ _update_view(
     beta_vmax.value,
     ldr_vmin.value,
     ldr_vmax.value,
+    instrument_select.value,
 )
 
 
@@ -553,17 +666,20 @@ _update_view(
 
 def _quicklook_options():
     """Build a mapping of label -> image path for available quicklook PNGs."""
+    cfg = _cfg()
+    quick_dir = cfg["quicklook_dir"]
+    latest = cfg["latest_image"]
     opts = {}
     # Collect dated quicklooks (sorted ascending), then append "Today" last.
     date_labels = []
-    if QUICKLOOK_DIR.exists():
-        for png in sorted(QUICKLOOK_DIR.glob("*.png")):
-            label = png.stem.replace("ceilometer_", "")
+    if quick_dir.exists():
+        for png in sorted(quick_dir.glob("*.png")):
+            label = png.stem.split("_")[-1] if "cloud_radar_" in png.stem else png.stem.replace("ceilometer_", "")
             date_labels.append((label, str(png)))
     for label, path in date_labels:
         opts[label] = path
-    if LATEST_IMAGE.exists():
-        opts["Today (latest)"] = str(LATEST_IMAGE)
+    if latest.exists():
+        opts["Today (latest)"] = str(latest)
     return opts or {"No images available": None}
 
 
@@ -626,6 +742,7 @@ _ql_timer = pn.state.add_periodic_callback(_refresh_latest_if_needed, period=60_
 
 # Ensure initial map is fresh
 _refresh_ql_options(preserve_current=True)
+_apply_instrument_defaults(CURRENT_INSTRUMENT, reset_time=True)
 
 @pn.depends(ql_date.param.value)
 def _quicklook_image(selected):
