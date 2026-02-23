@@ -1,0 +1,8 @@
+*
+!*.py
+!.gitignore
+# Ignore generated quicklook images and last-24h output
+quicklooks/
+last24h.png
+__pycache__/
+*.pyc
