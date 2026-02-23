@@ -51,9 +51,26 @@ def _list_nc_files(root: Path, start_dt: datetime) -> List[Path]:
     return [p for _, p in files]
 
 
+COMBINE_VARS = [
+    ("ZE_dBZ", "C1ZE", "C2ZE", "dbz"),
+    ("ZE45_dBZ", "C1ZE45", "C2ZE45", "dbz"),
+    ("MeanVel", "C1MeanVel", "C2MeanVel", "linear"),
+    ("ZDR", "C1ZDR", "C2ZDR", "linear"),
+    ("SRCX", "C1SRCX", "C2SRCX", "linear"),
+    ("SpecWidth", "C1SpecWidth", "C2SpecWidth", "linear"),
+    ("SLDR", "C1SLDR", "C2SLDR", "linear"),
+    ("Skew", "C1Skew", "C2Skew", "linear"),
+    ("RHV", "C1RHV", "C2RHV", "linear"),
+    ("PhiDP", "C1PhiDP", "C2PhiDP", "linear"),
+    ("Kurt", "C1Kurt", "C2Kurt", "linear"),
+    ("KDP", "C1KDP", "C2KDP", "linear"),
+    ("DiffAtt", "C1DiffAtt", "C2DiffAtt", "linear"),
+]
+
+
 def _combine_chirps(raw: xr.Dataset):
     """Combine chirp 1 and chirp 2 along range, using C1 time axis."""
-    required = ["C1Range", "C2Range", "C1ZE", "C2ZE", "C1MeanVel", "C2MeanVel"]
+    required = ["C1Range", "C2Range"]
     for r in required:
         if r not in raw:
             raise KeyError(f"Missing {r} in file")
@@ -62,24 +79,24 @@ def _combine_chirps(raw: xr.Dataset):
     r2 = raw["C2Range"].values
     ranges = np.concatenate([r1, r2])
 
-    t_len = raw["C1ZE"].sizes["Time"]
+    t_len = raw["Time"].sizes["Time"]
     r_len = len(ranges)
-    ze = np.full((t_len, r_len), np.nan, dtype=np.float32)
-    vel = np.full((t_len, r_len), np.nan, dtype=np.float32)
 
-    ze[:, : len(r1)] = raw["C1ZE"].values
-    ze[:, len(r1) :] = raw["C2ZE"].values
-    vel[:, : len(r1)] = raw["C1MeanVel"].values
-    vel[:, len(r1) :] = raw["C2MeanVel"].values
-
-    return ranges, ze, vel
-
-
-def _to_dbz(linear):
-    linear = np.where(linear > 0, linear, np.nan)
-    with np.errstate(divide="ignore"):
-        dbz = 10.0 * np.log10(linear)
-    return dbz.astype(np.float32)
+    combined = {}
+    for out_name, c1_name, c2_name, mode in COMBINE_VARS:
+        if c1_name not in raw or c2_name not in raw:
+            continue
+        arr = np.full((t_len, r_len), np.nan, dtype=np.float32)
+        arr[:, : len(r1)] = raw[c1_name].values
+        arr[:, len(r1) :] = raw[c2_name].values
+        # mask fill
+        arr = np.where(arr <= -900, np.nan, arr)
+        if mode == "dbz":
+            arr = np.where(arr > 0, arr, np.nan)
+            with np.errstate(divide="ignore"):
+                arr = 10.0 * np.log10(arr)
+        combined[out_name] = arr.astype(np.float32)
+    return ranges, combined
 
 
 def _load_nc(path: Path) -> xr.Dataset:
@@ -90,17 +107,10 @@ def _load_nc(path: Path) -> xr.Dataset:
     time = base + raw["Time"].astype("timedelta64[s]") + raw["Timems"].astype("timedelta64[ms]")
     time_vals = np.array(time.values)
 
-    ranges, ze_lin, vel_lin = _combine_chirps(raw)
-    ze_dbz = _to_dbz(ze_lin)
-    vel = np.where(vel_lin > -900, vel_lin, np.nan).astype(np.float32)
+    ranges, combined = _combine_chirps(raw)
 
-    ds = xr.Dataset(
-        {
-            "ZE_dBZ": (("time", "range"), ze_dbz),
-            "MeanVel": (("time", "range"), vel),
-        },
-        coords={"time": time_vals, "range": ranges},
-    )
+    data_vars = {name: (("time", "range"), arr) for name, arr in combined.items()}
+    ds = xr.Dataset(data_vars, coords={"time": time_vals, "range": ranges})
     return ds.sortby("time")
 
 

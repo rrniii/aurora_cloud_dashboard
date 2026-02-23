@@ -28,8 +28,12 @@ INSTRUMENTS = {
         "consolidated": True,
         "height_load_max": 10_000,
         "top_range_default": 8000,
-        "var1": {"name": "beta_att", "label": "Attenuated Backscatter", "clim": (1e-7, 1e-4), "log": True, "colorscale": "Cividis"},
-        "var2": {"name": "linear_depol_ratio", "label": "Linear Depolarization Ratio", "clim": (0.0, 0.5), "log": False, "colorscale": "Viridis"},
+        "vars": {
+            "beta_att": {"label": "Attenuated Backscatter", "clim": (1e-7, 1e-4), "log": True, "colorscale": "Cividis"},
+            "linear_depol_ratio": {"label": "Linear Depolarization Ratio", "clim": (0.0, 0.5), "log": False, "colorscale": "Viridis"},
+        },
+        "default_top": "beta_att",
+        "default_bottom": "linear_depol_ratio",
         "quicklook_dir": Path("/home/aurora/aurora_cloud_dashboard/quicklooks/ceilometer"),
         "latest_image": Path("/home/aurora/aurora_cloud_dashboard/last24h.png"),
     },
@@ -40,8 +44,23 @@ INSTRUMENTS = {
         "consolidated": True,
         "height_load_max": 9_000,
         "top_range_default": 9_000,
-        "var1": {"name": "ZE_dBZ", "label": "C1+C2 ZE (dBZ)", "clim": (-30.0, 10.0), "log": False, "colorscale": "Cividis"},
-        "var2": {"name": "MeanVel", "label": "C1+C2 Mean Velocity (m/s)", "clim": (-5.0, 5.0), "log": False, "colorscale": "RdBu_r"},
+        "vars": {
+            "ZE_dBZ": {"label": "ZE (dBZ)", "clim": (-30.0, 10.0), "log": False, "colorscale": "Cividis"},
+            "ZE45_dBZ": {"label": "ZE45 (dBZ)", "clim": (-30.0, 10.0), "log": False, "colorscale": "Cividis"},
+            "MeanVel": {"label": "Mean Velocity (m/s)", "clim": (-5.0, 5.0), "log": False, "colorscale": "RdBu_r"},
+            "ZDR": {"label": "ZDR (dB)", "clim": (-10.0, 6.0), "log": False, "colorscale": "RdBu_r"},
+            "SRCX": {"label": "SRCX", "clim": (0.0, 1.0), "log": False, "colorscale": "Viridis"},
+            "SpecWidth": {"label": "Spectrum Width (m/s)", "clim": (0.0, 3.0), "log": False, "colorscale": "Plasma"},
+            "SLDR": {"label": "SLDR (dB)", "clim": (-30.0, 10.0), "log": False, "colorscale": "RdBu_r"},
+            "Skew": {"label": "Skew", "clim": (-2.0, 2.0), "log": False, "colorscale": "RdBu_r"},
+            "RHV": {"label": "RHV", "clim": (0.0, 1.0), "log": False, "colorscale": "Viridis"},
+            "PhiDP": {"label": "PhiDP (rad)", "clim": (-2.0, 2.0), "log": False, "colorscale": "RdBu_r"},
+            "Kurt": {"label": "Kurtosis", "clim": (0.0, 10.0), "log": False, "colorscale": "Magma"},
+            "KDP": {"label": "KDP (rad/km)", "clim": (-4.0, 4.0), "log": False, "colorscale": "RdBu_r"},
+            "DiffAtt": {"label": "Differential Attenuation (dB/km)", "clim": (-5.0, 5.0), "log": False, "colorscale": "RdBu_r"},
+        },
+        "default_top": "ZE_dBZ",
+        "default_bottom": "MeanVel",
         "quicklook_dir": Path("/home/aurora/aurora_cloud_dashboard/quicklooks/cloud_radar"),
         "latest_image": Path("/home/aurora/aurora_cloud_dashboard/last24h_cloudradar.png"),
     },
@@ -228,10 +247,12 @@ range_start = pn.widgets.DatetimePicker(name="Start (UTC)", value=default_start)
 range_end = pn.widgets.DatetimePicker(name="End (UTC)", value=default_end)
 top_range_m = pn.widgets.IntInput(name="Top range (m)", value=_cfg()["top_range_default"], step=100, start=500)
 bottom_range_m = pn.widgets.IntInput(name="Bottom range (m)", value=0, step=100, start=0)
-beta_vmin = pn.widgets.FloatInput(name="Var1 min", value=_cfg()["var1"]["clim"][0], step=0.1)
-beta_vmax = pn.widgets.FloatInput(name="Var1 max", value=_cfg()["var1"]["clim"][1], step=0.1)
-ldr_vmin = pn.widgets.FloatInput(name="Var2 min", value=_cfg()["var2"]["clim"][0], step=0.1)
-ldr_vmax = pn.widgets.FloatInput(name="Var2 max", value=_cfg()["var2"]["clim"][1], step=0.1)
+var1_select = pn.widgets.Select(name="Top var", options=list(_cfg()["vars"].keys()), value=_cfg()["default_top"])
+var2_select = pn.widgets.Select(name="Bottom var", options=list(_cfg()["vars"].keys()), value=_cfg()["default_bottom"])
+beta_vmin = pn.widgets.FloatInput(name="Var1 min", value=_cfg()["vars"][var1_select.value]["clim"][0], step=0.1)
+beta_vmax = pn.widgets.FloatInput(name="Var1 max", value=_cfg()["vars"][var1_select.value]["clim"][1], step=0.1)
+ldr_vmin = pn.widgets.FloatInput(name="Var2 min", value=_cfg()["vars"][var2_select.value]["clim"][0], step=0.1)
+ldr_vmax = pn.widgets.FloatInput(name="Var2 max", value=_cfg()["vars"][var2_select.value]["clim"][1], step=0.1)
 prev_btn = pn.widgets.Button(name="Previous Day", button_type="default")
 next_btn = pn.widgets.Button(name="Next Day/Current Day", button_type="default")
 live_toggle = pn.widgets.Toggle(name="Live Update (Last 24h)", button_type="primary", value=True)
@@ -253,9 +274,15 @@ def _apply_instrument_defaults(inst: str, reset_time: bool = True):
     _refresh_base_dataset()
     cfg = _cfg()
 
-    # Relabel color limit widgets
-    var1 = cfg["var1"]
-    var2 = cfg["var2"]
+    vars_cfg = cfg["vars"]
+    var1_name = cfg["default_top"]
+    var2_name = cfg["default_bottom"]
+    var1_select.options = list(vars_cfg.keys())
+    var2_select.options = list(vars_cfg.keys())
+    var1_select.value = var1_name
+    var2_select.value = var2_name
+    var1 = vars_cfg[var1_name]
+    var2 = vars_cfg[var2_name]
     beta_vmin.name = f"{var1['label']} min"
     beta_vmax.name = f"{var1['label']} max"
     ldr_vmin.name = f"{var2['label']} min"
@@ -349,6 +376,26 @@ def _on_calendar_instrument_change(event):
 
 calendar_instrument.param.watch(_on_calendar_instrument_change, "value")
 
+
+def _on_var_change(event):
+    """Update limit widgets when variable selection changes."""
+    cfg = _cfg()
+    vars_cfg = cfg["vars"]
+    var1 = vars_cfg.get(var1_select.value, None)
+    var2 = vars_cfg.get(var2_select.value, None)
+    if var1:
+        beta_vmin.name = f"{var1['label']} min"
+        beta_vmax.name = f"{var1['label']} max"
+        beta_vmin.value, beta_vmax.value = var1["clim"]
+    if var2:
+        ldr_vmin.name = f"{var2['label']} min"
+        ldr_vmax.name = f"{var2['label']} max"
+        ldr_vmin.value, ldr_vmax.value = var2["clim"]
+
+
+var1_select.param.watch(_on_var_change, "value")
+var2_select.param.watch(_on_var_change, "value")
+
 def _auto_refresh():
     """Periodic refresh when live mode is on."""
     if live_toggle.value:
@@ -431,6 +478,8 @@ plot_pane = pn.pane.Plotly(config={"responsive": True}, sizing_mode="stretch_bot
     range_end.param.value,
     bottom_range_m.param.value,
     top_range_m.param.value,
+    var1_select.param.value,
+    var2_select.param.value,
     beta_vmin.param.value,
     beta_vmax.param.value,
     ldr_vmin.param.value,
@@ -438,14 +487,15 @@ plot_pane = pn.pane.Plotly(config={"responsive": True}, sizing_mode="stretch_bot
     instrument_select.param.value,
     watch=True,
 )
-def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax, instrument):
+def _update_view(start, end, bottom_val, top_val, var1_name, var2_name, bmin, bmax, lmin, lmax, instrument):
     """Render both heatmaps for the current window and control values."""
     bottom = max(float(bottom_val), 0.0)
     top = max(float(top_val), bottom + 100.0)
     ds = open_window(start, end, bottom_m=bottom, top_m=top)
     cfg = _cfg()
-    var1 = cfg["var1"]
-    var2 = cfg["var2"]
+    vars_cfg = cfg["vars"]
+    var1 = vars_cfg.get(var1_name)
+    var2 = vars_cfg.get(var2_name)
     # Simple light theme for plots
     bg = "white"
     fg = "#222222"
@@ -465,7 +515,7 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax, instru
         plot_pane.object = fig
         return
     # Colorbar configs
-    if var1["log"]:
+    if var1 and var1.get("log"):
         b_cmin = np.log10(bmin)
         b_cmax = np.log10(bmax)
         b_tickvals = list(range(int(np.floor(b_cmin)), int(np.ceil(b_cmax)) + 1))
@@ -481,16 +531,16 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax, instru
         shared_xaxes=True,
         shared_yaxes=False,
         vertical_spacing=0.05,
-        subplot_titles=(var1["label"], var2["label"]),
+        subplot_titles=(var1["label"] if var1 else "", var2["label"] if var2 else ""),
     )
-    if var1["name"] in ds:
-        fig.add_trace(_make_plot(ds, var1["name"], (bmin, bmax), var1["log"], coloraxis="coloraxis"), row=1, col=1)
-    if var2["name"] in ds:
-        if var1["name"] == "beta_att" and var2["name"] == "linear_depol_ratio" and "beta_att" in ds:
+    if var1 and var1_name in ds:
+        fig.add_trace(_make_plot(ds, var1_name, (bmin, bmax), var1.get("log", False), coloraxis="coloraxis"), row=1, col=1)
+    if var2 and var2_name in ds:
+        if var1_name == "beta_att" and var2_name == "linear_depol_ratio" and "beta_att" in ds:
             # Only plot depol where beta is above threshold.
             times = pd.to_datetime(ds["time"].values)
             heights = ds["range"].values
-            ldr = np.array(ds[var2["name"]].transpose("range", "time"))
+            ldr = np.array(ds[var2_name].transpose("range", "time"))
             beta_vals = np.array(ds["beta_att"].transpose("range", "time"))
             ldr = np.where((ldr >= 0.0) & (ldr <= 1.0), ldr, np.nan)
             mask_threshold = 10 ** -6.5
@@ -511,7 +561,7 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax, instru
         else:
             times = pd.to_datetime(ds["time"].values)
             heights = ds["range"].values
-            ldr = np.array(ds[var2["name"]].transpose("range", "time"))
+            ldr = np.array(ds[var2_name].transpose("range", "time"))
             fig.add_trace(
                 go.Heatmap(
                     x=times,
@@ -590,11 +640,11 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax, instru
         height=600,
         margin=dict(l=60, r=90, t=40, b=120),
         coloraxis=dict(
-            colorscale=var1["colorscale"],
+            colorscale=var1["colorscale"] if var1 else "Cividis",
             cmin=b_cmin,
             cmax=b_cmax,
             colorbar=dict(
-                title=var1["label"],
+                title=var1["label"] if var1 else "",
                 x=1.04,
                 y=0.77,
                 len=0.35,
@@ -604,10 +654,10 @@ def _update_view(start, end, bottom_val, top_val, bmin, bmax, lmin, lmax, instru
             ),
         ),
         coloraxis2=dict(
-            colorscale=var2["colorscale"],
+            colorscale=var2["colorscale"] if var2 else "Viridis",
             cmin=lmin,
             cmax=lmax,
-            colorbar=dict(title=var2["label"], x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg, size=12)),
+            colorbar=dict(title=var2["label"] if var2 else "", x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg, size=12)),
         ),
         paper_bgcolor=bg,
         plot_bgcolor=bg,
@@ -665,6 +715,8 @@ _update_view(
     range_end.value,
     bottom_range_m.value,
     top_range_m.value,
+    var1_select.value,
+    var2_select.value,
     beta_vmin.value,
     beta_vmax.value,
     ldr_vmin.value,
@@ -778,6 +830,7 @@ body, .bk {
 controls = pn.Card(
     pn.Column(
         pn.Row(instrument_select, range_start, range_end, live_toggle, sizing_mode="stretch_width"),
+        pn.Row(var1_select, var2_select, sizing_mode="stretch_width"),
         pn.Row(bottom_range_m, top_range_m, sizing_mode="stretch_width"),
         pn.Row(beta_vmin, beta_vmax, ldr_vmin, ldr_vmax, sizing_mode="stretch_width"),
         pn.Row(prev_btn, next_btn, sizing_mode="stretch_width", margin=(5, 0, 0, 0)),
