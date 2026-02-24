@@ -1,5 +1,7 @@
 *
 !*.py
+!README.md
+!LICENSE
 !.gitignore
 # Ignore generated quicklook images and last-24h output
 quicklooks/
