@@ -470,7 +470,8 @@ range_start.param.watch(_on_manual_time_change, "value")
 range_end.param.watch(_on_manual_time_change, "value")
 
 # Persistent plot pane so we can listen for zoom/pan events (relayout).
-plot_pane = pn.pane.Plotly(config={"responsive": True}, sizing_mode="stretch_both")
+# Use stretch_width so height stays predictable on mobile.
+plot_pane = pn.pane.Plotly(config={"responsive": True}, sizing_mode="stretch_width")
 
 
 @pn.depends(
@@ -530,7 +531,7 @@ def _update_view(start, end, bottom_val, top_val, var1_name, var2_name, bmin, bm
         cols=1,
         shared_xaxes=True,
         shared_yaxes=False,
-        vertical_spacing=0.05,
+        vertical_spacing=0.08,
         subplot_titles=(var1["label"] if var1 else "", var2["label"] if var2 else ""),
     )
     if var1 and var1_name in ds:
@@ -637,27 +638,27 @@ def _update_view(start, end, bottom_val, top_val, var1_name, var2_name, bmin, bm
     # Keep both panels locked together when the user pans/zooms vertically.
     fig.update_yaxes(matches="y", row=2, col=1)
     fig.update_layout(
-        height=600,
-        margin=dict(l=60, r=90, t=40, b=120),
+        height=900,
+        margin=dict(l=50, r=70, t=30, b=90),
         coloraxis=dict(
             colorscale=var1["colorscale"] if var1 else "Cividis",
             cmin=b_cmin,
             cmax=b_cmax,
             colorbar=dict(
-                title=var1["label"] if var1 else "",
+                title=dict(text=var1["label"] if var1 else "", side="right"),
                 x=1.04,
                 y=0.77,
                 len=0.35,
                 tickvals=b_tickvals,
                 ticktext=b_ticktext,
-                tickfont=dict(color=fg, size=12),
+                tickfont=dict(color=fg, size=9),
             ),
         ),
         coloraxis2=dict(
             colorscale=var2["colorscale"] if var2 else "Viridis",
             cmin=lmin,
             cmax=lmax,
-            colorbar=dict(title=var2["label"] if var2 else "", x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg, size=12)),
+            colorbar=dict(title=dict(text=var2["label"] if var2 else "", side="right"), x=1.04, y=0.27, len=0.35, tickfont=dict(color=fg, size=9)),
         ),
         paper_bgcolor=bg,
         plot_bgcolor=bg,
@@ -824,16 +825,30 @@ body, .bk {
     font-family: "SF Pro Display","SF Pro","-apple-system","BlinkMacSystemFont","Segoe UI",sans-serif;
     font-size: 15px;
 }
+.mobile-stack {
+    flex-wrap: wrap !important;
+    gap: 8px;
+}
+.mobile-stack > .bk {
+    flex: 1 1 220px;
+    min-width: 160px;
+}
+@media (max-width: 768px) {
+    body, .bk { font-size: 14px; }
+    .bk.card { padding: 8px; }
+    .bk-panel-card { padding: 8px; }
+    .bk.pn-row { gap: 8px; }
+}
 """
 
 # Controls card: group all widgets in a tidy stack.
 controls = pn.Card(
     pn.Column(
-        pn.Row(instrument_select, range_start, range_end, live_toggle, sizing_mode="stretch_width"),
-        pn.Row(var1_select, var2_select, sizing_mode="stretch_width"),
-        pn.Row(bottom_range_m, top_range_m, sizing_mode="stretch_width"),
-        pn.Row(beta_vmin, beta_vmax, ldr_vmin, ldr_vmax, sizing_mode="stretch_width"),
-        pn.Row(prev_btn, next_btn, sizing_mode="stretch_width", margin=(5, 0, 0, 0)),
+        pn.Row(instrument_select, range_start, range_end, live_toggle, sizing_mode="stretch_width", css_classes=["mobile-stack"]),
+        pn.Row(var1_select, var2_select, sizing_mode="stretch_width", css_classes=["mobile-stack"]),
+        pn.Row(bottom_range_m, top_range_m, sizing_mode="stretch_width", css_classes=["mobile-stack"]),
+        pn.Row(beta_vmin, beta_vmax, ldr_vmin, ldr_vmax, sizing_mode="stretch_width", css_classes=["mobile-stack"]),
+        pn.Row(prev_btn, next_btn, sizing_mode="stretch_width", margin=(5, 0, 0, 0), css_classes=["mobile-stack"]),
         sizing_mode="stretch_width",
     ),
     title="",
@@ -848,6 +863,7 @@ template = pn.template.MaterialTemplate(
     title="AURORA Data Viewer",
     header_background=ACCENT,
     header_color="white",
+    main_max_width="1200px",
 )
 
 interactive_tab = pn.Column(controls, plot_pane, sizing_mode="stretch_both")
