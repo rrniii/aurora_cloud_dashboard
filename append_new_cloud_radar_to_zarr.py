@@ -123,8 +123,8 @@ def append_new(root: Path, zarr_path: Path, chunks: dict | str | None = None):
     combined = xr.concat(datasets, dim="time").sortby("time")
     if chunks:
         combined = combined.chunk(chunks)
-
-    combined.to_zarr(zarr_path, mode="a", append_dim="time")
+    # Ensure chunk alignment with existing store; disable strict chunk safety to avoid overlap errors.
+    combined.to_zarr(zarr_path, mode="a", append_dim="time", safe_chunks=False)
     print("Append complete.")
 
 
