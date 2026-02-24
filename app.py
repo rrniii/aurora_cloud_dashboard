@@ -638,7 +638,7 @@ def _update_view(start, end, bottom_val, top_val, var1_name, var2_name, bmin, bm
     # Keep both panels locked together when the user pans/zooms vertically.
     fig.update_yaxes(matches="y", row=2, col=1)
     fig.update_layout(
-        height=900,
+        height=max(630, int(pn.state.viewport_height * 0.675)) if hasattr(pn.state, "viewport_height") else 810,
         margin=dict(l=50, r=70, t=30, b=90),
         coloraxis=dict(
             colorscale=var1["colorscale"] if var1 else "Cividis",
@@ -833,6 +833,12 @@ body, .bk {
     flex: 1 1 220px;
     min-width: 160px;
 }
+.small-card .bk-card-header {
+    padding: 4px 8px;
+}
+.small-card .bk-card-body {
+    padding: 6px 8px;
+}
 @media (max-width: 768px) {
     body, .bk { font-size: 14px; }
     .bk.card { padding: 8px; }
@@ -854,6 +860,7 @@ controls = pn.Card(
     title="",
     collapsible=False,
     sizing_mode="stretch_width",
+    css_classes=["small-card"],
 )
 
 pn.extension(raw_css=[css])
@@ -863,7 +870,7 @@ template = pn.template.MaterialTemplate(
     title="AURORA Data Viewer",
     header_background=ACCENT,
     header_color="white",
-    main_max_width="1200px",
+    main_max_width="1800px",  # wide but keeps a valid string
 )
 
 interactive_tab = pn.Column(controls, plot_pane, sizing_mode="stretch_both")

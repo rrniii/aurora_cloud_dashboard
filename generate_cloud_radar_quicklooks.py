@@ -78,7 +78,7 @@ def _plot_day(ds_day: xr.Dataset, date_label: str, output: Path) -> None:
 
     fig.suptitle(date_label)
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.22, hspace=0.18)
+    fig.subplots_adjust(top=0.96, bottom=0.22, hspace=0.18)
     _ensure_dir(output.parent)
     fig.savefig(output, dpi=150)
     plt.close(fig)

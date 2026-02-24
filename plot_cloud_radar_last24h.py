@@ -92,7 +92,7 @@ def plot_last_24h(zarr_path: Path, output: Path):
 
     fig.suptitle("Cloud Radar – Last 24 hours")
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.22, hspace=0.18)
+    fig.subplots_adjust(top=0.96, bottom=0.22, hspace=0.18)
     fig.savefig(output, dpi=150)
     print(f"Wrote {output}")
 
