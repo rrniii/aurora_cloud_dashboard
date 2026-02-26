@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import panel as pn
+from panel.io import hold
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import xarray as xr
@@ -273,50 +274,64 @@ def _apply_instrument_defaults(inst: str, reset_time: bool = True):
     CURRENT_INSTRUMENT = inst
     _refresh_base_dataset()
     cfg = _cfg()
+    with hold():
+        vars_cfg = cfg["vars"]
+        var1_name = cfg["default_top"]
+        var2_name = cfg["default_bottom"]
+        var1_select.options = list(vars_cfg.keys())
+        var2_select.options = list(vars_cfg.keys())
+        var1_select.value = var1_name
+        var2_select.value = var2_name
+        var1 = vars_cfg[var1_name]
+        var2 = vars_cfg[var2_name]
+        beta_vmin.name = f"{var1['label']} min"
+        beta_vmax.name = f"{var1['label']} max"
+        ldr_vmin.name = f"{var2['label']} min"
+        ldr_vmax.name = f"{var2['label']} max"
 
-    vars_cfg = cfg["vars"]
-    var1_name = cfg["default_top"]
-    var2_name = cfg["default_bottom"]
-    var1_select.options = list(vars_cfg.keys())
-    var2_select.options = list(vars_cfg.keys())
-    var1_select.value = var1_name
-    var2_select.value = var2_name
-    var1 = vars_cfg[var1_name]
-    var2 = vars_cfg[var2_name]
-    beta_vmin.name = f"{var1['label']} min"
-    beta_vmax.name = f"{var1['label']} max"
-    ldr_vmin.name = f"{var2['label']} min"
-    ldr_vmax.name = f"{var2['label']} max"
+        def _set_input(inp, vmin, vmax):
+            inp.value = vmin
+            # heuristic step
+            span = abs(vmax - vmin) or 1.0
+            inp.step = span / 100.0
+            inp.format = "0.000000e+00" if max(abs(vmin), abs(vmax)) < 1e-3 else None
 
-    def _set_input(inp, vmin, vmax):
-        inp.value = vmin
-        # heuristic step
-        span = abs(vmax - vmin) or 1.0
-        inp.step = span / 100.0
-        inp.format = "0.000000e+00" if max(abs(vmin), abs(vmax)) < 1e-3 else None
+        _set_input(beta_vmin, var1["clim"][0], var1["clim"][1])
+        _set_input(beta_vmax, var1["clim"][1], var1["clim"][0])
+        _set_input(ldr_vmin, var2["clim"][0], var2["clim"][1])
+        _set_input(ldr_vmax, var2["clim"][1], var2["clim"][0])
 
-    _set_input(beta_vmin, var1["clim"][0], var1["clim"][1])
-    _set_input(beta_vmax, var1["clim"][1], var1["clim"][0])
-    _set_input(ldr_vmin, var2["clim"][0], var2["clim"][1])
-    _set_input(ldr_vmax, var2["clim"][1], var2["clim"][0])
+        bottom_range_m.value = 0
+        top_range_m.value = cfg["top_range_default"]
 
-    bottom_range_m.value = 0
-    top_range_m.value = cfg["top_range_default"]
+        calendar_instrument.value = inst
 
-    calendar_instrument.value = inst
+        if reset_time:
+            tmin, tmax = _dataset_time_bounds()
+            end = tmax or datetime.utcnow()
+            start = end - DEFAULT_WINDOW
+            range_start.value = start
+            range_end.value = end
+            _set_live(True)
 
-    if reset_time:
-        tmin, tmax = _dataset_time_bounds()
-        end = tmax or datetime.utcnow()
-        start = end - DEFAULT_WINDOW
-        range_start.value = start
-        range_end.value = end
-        _set_live(True)
-
-    _refresh_ql_options(preserve_current=False)
-    # Force quicklook pane refresh even if selection string didn't change
-    ql_date.param.trigger("value")
+        _refresh_ql_options(preserve_current=False)
+        # Force quicklook pane refresh even if selection string didn't change
+        ql_date.param.trigger("value")
     _instrument_guard = False
+    # Run a single consolidated refresh after batching widget changes
+    _update_view(
+        range_start.value,
+        range_end.value,
+        bottom_range_m.value,
+        top_range_m.value,
+        var1_select.value,
+        var2_select.value,
+        beta_vmin.value,
+        beta_vmax.value,
+        ldr_vmin.value,
+        ldr_vmax.value,
+        instrument_select.value,
+    )
 
 
 def _refresh_to_latest(_event=None):
@@ -490,6 +505,9 @@ plot_pane = pn.pane.Plotly(config={"responsive": True}, sizing_mode="stretch_wid
 )
 def _update_view(start, end, bottom_val, top_val, var1_name, var2_name, bmin, bmax, lmin, lmax, instrument):
     """Render both heatmaps for the current window and control values."""
+    if _instrument_guard:
+        # Skip expensive re-renders while we batch instrument switch updates.
+        return
     bottom = max(float(bottom_val), 0.0)
     top = max(float(top_val), bottom + 100.0)
     ds = open_window(start, end, bottom_m=bottom, top_m=top)
