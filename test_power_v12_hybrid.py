@@ -26,6 +26,7 @@ from power_v12_hybrid import (
     campaign_score_surfaces,
     evaluation_contract_from_forecast,
     fit_bounded_load_residual,
+    promotion_gate_review,
 )
 
 
@@ -406,3 +407,50 @@ class HybridCandidateTests(unittest.TestCase):
         self.assertEqual(solar["status"], "evidence")
         self.assertEqual(solar["candidate_mae"], 0.0)
         self.assertEqual(solar["baseline_mae"], 300.0)
+
+    def test_promotion_review_requires_campaign_evidence_but_never_auto_promotes(self) -> None:
+        issues = pd.date_range("2026-06-01T00:00:00", periods=30, freq="8h")
+        leads = np.asarray([3.0, 12.0, 30.0, 60.0])
+        issue_values = np.repeat(issues.to_numpy(dtype="datetime64[ns]"), len(leads))
+        lead_values = np.tile(leads, len(issues))
+        valid_values = np.asarray(
+            [
+                issue + pd.Timedelta(hours=float(lead))
+                for issue in issues
+                for lead in leads
+            ],
+            dtype="datetime64[ns]",
+        )
+        count = len(issue_values)
+        evidence = xr.Dataset(
+            {
+                "IssueTime": (("record",), issue_values),
+                "ValidTime": (("record",), valid_values),
+                "LeadHours": (("record",), lead_values),
+                "SOCAuthoringAnchor": (("record",), np.full(count, 80.0)),
+                "CandidateSOC": (("record",), np.full(count, 76.0)),
+                "BaselineSOC": (("record",), np.full(count, 77.0)),
+                "ObservedSOC": (("record",), np.full(count, 75.0)),
+                "CandidateLoadWatts": (("record",), np.full(count, 105.0)),
+                "BaselineLoadWatts": (("record",), np.full(count, 110.0)),
+                "ObservedLoadWatts": (("record",), np.full(count, 100.0)),
+                "CandidateSolarWatts": (("record",), np.full(count, 900.0)),
+                "BaselineSolarWatts": (("record",), np.full(count, 800.0)),
+                "ObservedSolarWatts": (("record",), np.full(count, 900.0)),
+                "SolarEvaluationAvailable": (("record",), np.ones(count, dtype=bool)),
+                "EvaluationAvailable": (("record",), np.ones(count, dtype=bool)),
+            },
+            coords={"record": np.arange(count)},
+        )
+
+        review = promotion_gate_review(evidence)
+
+        self.assertEqual(review["independent_evidence"]["0_6h"]["status"], "eligible")
+        self.assertEqual(review["soc"]["status"], "pass")
+        self.assertEqual(review["long_lead_soc"]["24_48h"]["status"], "pass")
+        self.assertEqual(review["long_lead_soc"]["48_96h"]["status"], "pass")
+        self.assertEqual(review["solar"]["status"], "pass")
+        self.assertEqual(review["load"]["status"], "pass")
+        self.assertEqual(review["quantitative_gates"], "pass")
+        self.assertEqual(review["ensemble"], "blocked_memberwise_candidate_not_generated")
+        self.assertEqual(review["status"], "not_eligible")
