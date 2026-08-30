@@ -46,6 +46,12 @@ EVALUATION_CONTRACT_ATTRS = (
     "baseline_control_system_version",
     "local_feature_contract_id",
 )
+SOLAR_MPP_MODE_FIELDS = (
+    "SolarMPPMode_East",
+    "SolarMPPMode_South",
+    "SolarMPPMode_West",
+)
+MPP_ACTIVE_MODE = 2.0
 
 
 def utc_now_iso() -> str:
@@ -85,6 +91,46 @@ def _observed_load_w(power: xr.Dataset) -> pd.Series:
     if not load_fields:
         return pd.Series(dtype=np.float64)
     return frame[load_fields].sum(axis=1, min_count=1).clip(lower=0.0)
+
+
+def _observed_solar_w(power: xr.Dataset) -> pd.Series:
+    if "time" not in power.coords:
+        return pd.Series(dtype=np.float64)
+    index = pd.DatetimeIndex(power["time"].values)
+    fields = [
+        name
+        for name in ("SolarWatts_East", "SolarWatts_South", "SolarWatts_West")
+        if name in power and power[name].dims == ("time",)
+    ]
+    if not fields:
+        return pd.Series(np.nan, index=index, dtype=np.float64)
+    return pd.DataFrame(
+        {name: np.asarray(power[name].values, dtype=np.float64) for name in fields},
+        index=index,
+    ).sum(axis=1, min_count=1).clip(lower=0.0)
+
+
+def _mpp_active_available_power_mask(power: xr.Dataset) -> pd.Series:
+    """Return valid available-PV truth targets from Victron mode 791.
+
+    Every array must report mode 2 (MPPT active).  A missing or limited charger
+    means delivered watts could be battery-limited and is excluded rather than
+    masquerading as a solar-model miss.
+    """
+    if "time" not in power.coords:
+        return pd.Series(dtype=bool)
+    index = pd.DatetimeIndex(power["time"].values)
+    if not all(
+        name in power and power[name].dims == ("time",) for name in SOLAR_MPP_MODE_FIELDS
+    ):
+        return pd.Series(False, index=index, dtype=bool)
+    values = np.column_stack(
+        [np.asarray(power[name].values, dtype=np.float64) for name in SOLAR_MPP_MODE_FIELDS]
+    )
+    return pd.Series(
+        np.all(values == MPP_ACTIVE_MODE, axis=1),
+        index=index,
+    )
 
 
 def _repeat_issue_field(
@@ -523,6 +569,8 @@ def build_campaign_evidence(
     """
     observed_soc = _power_series(power, "BatterySOC")
     observed_load = _observed_load_w(power)
+    observed_solar = _observed_solar_w(power)
+    mpp_active = _mpp_active_available_power_mask(power)
     records: list[dict[str, object]] = []
     incompatible_pair_count = 0
     for manifest, bundle in completed_pair_bundles(pairs_root):
@@ -556,6 +604,15 @@ def build_campaign_evidence(
         observed_load_values = observed_load.reindex(
             times, method="nearest", tolerance=pd.Timedelta(minutes=10)
         ).to_numpy(dtype=np.float64)
+        observed_solar_values = observed_solar.reindex(
+            times, method="nearest", tolerance=pd.Timedelta(minutes=10)
+        ).to_numpy(dtype=np.float64)
+        mpp_active_values = mpp_active.reindex(
+            times, method="nearest", tolerance=pd.Timedelta(minutes=10)
+        ).eq(True).to_numpy(dtype=bool)
+        candidate_available_pv = "available" in str(
+            candidate.attrs.get("solar_power_semantics", "")
+        ).lower()
         initial_soc = float(candidate.attrs.get("initial_soc_pct", np.nan))
         for index, valid_time in enumerate(times):
             available = bool(np.isfinite(observed_soc_values[index]))
@@ -591,6 +648,11 @@ def build_campaign_evidence(
                     "ObservedLoadWatts": float(observed_load_values[index]),
                     "CandidateSolarWatts": float(candidate_solar[index]),
                     "BaselineSolarWatts": float(baseline_solar[index]),
+                    "ObservedSolarWatts": float(observed_solar_values[index]),
+                    "SolarEvaluationAvailable": bool(
+                        np.isfinite(observed_solar_values[index])
+                        and (not candidate_available_pv or mpp_active_values[index])
+                    ),
                     "ECMWFGHI": float(ghi[index]),
                     "EvaluationAvailable": available,
                 }
@@ -629,7 +691,7 @@ def build_campaign_evidence(
             "evidence_status": "complete_pair_bundles_materialised",
             "evaluation_contract": json.dumps(dict(evaluation_contract or {}), sort_keys=True),
             "incompatible_pair_count": int(incompatible_pair_count),
-            "solar_metric_status": "excluded_until_mpp_active_observed_power_is_available",
+            "solar_metric_status": "mpp_active_available_power_only",
             "ensemble_metric_status": "not_generated_in_bounded_initial_candidate",
             "reserve_event_status": "insufficient_events",
         },
@@ -663,6 +725,34 @@ def _metric_summary(rows: pd.DataFrame) -> dict[str, float | int | str]:
     }
 
 
+def _solar_metric_summary(rows: pd.DataFrame) -> dict[str, float | int | str]:
+    """Compare forecast solar only against uncensored available-PV samples."""
+    if rows.empty or "SolarEvaluationAvailable" not in rows:
+        return {
+            "status": "insufficient_mpp_active_available_power_evidence",
+            "samples": 0,
+            "cycles": 0,
+        }
+    eligible = rows.loc[rows["SolarEvaluationAvailable"].astype(bool)].copy()
+    metrics = _error_metrics(
+        eligible,
+        candidate="CandidateSolarWatts",
+        baseline="BaselineSolarWatts",
+        observed="ObservedSolarWatts",
+    )
+    if metrics is None:
+        return {
+            "status": "insufficient_mpp_active_available_power_evidence",
+            "samples": int(len(eligible)),
+            "cycles": int(eligible["IssueTime"].nunique()) if "IssueTime" in eligible else 0,
+        }
+    return {
+        **metrics,
+        "cycles": int(eligible["IssueTime"].nunique()),
+        "status": "evidence" if len(eligible) >= 2 else "diagnostic_sparse",
+    }
+
+
 def campaign_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
     """Return cumulative campaign and last-24h diagnostic score surfaces."""
     try:
@@ -674,9 +764,17 @@ def campaign_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
         empty = {bucket: _metric_summary(pd.DataFrame()) for bucket, _, _ in LEAD_BUCKETS}
         return {
             "generated_at_utc": utc_now_iso(),
-            "campaign_evidence": {"lead_buckets": empty, "status": "insufficient_evidence"},
-            "daily_diagnostic": {"lead_buckets": empty, "status": "insufficient_evidence"},
-            "solar": "excluded_until_mpp_active_observed_power_is_available",
+            "campaign_evidence": {
+                "lead_buckets": empty,
+                "solar": _solar_metric_summary(pd.DataFrame()),
+                "status": "insufficient_evidence",
+            },
+            "daily_diagnostic": {
+                "lead_buckets": empty,
+                "solar": _solar_metric_summary(pd.DataFrame()),
+                "status": "insufficient_evidence",
+            },
+            "solar": "mpp_active_available_power_only",
             "ensemble": "not_generated_in_bounded_initial_candidate",
             "reserve_events": "insufficient_events",
             "evaluation_contract": evaluation_contract,
@@ -705,7 +803,12 @@ def campaign_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
                     "cycles": cycles,
                     "status": "diagnostic_sparse" if cycles < 30 else "evidence",
                 }
-        return {"lead_buckets": buckets, "strata": strata, "status": "evidence" if len(selected) else "insufficient_evidence"}
+        return {
+            "lead_buckets": buckets,
+            "strata": strata,
+            "solar": _solar_metric_summary(selected),
+            "status": "evidence" if len(selected) else "insufficient_evidence",
+        }
 
     daily = (
         available.loc[available["ValidTime"] > latest - pd.Timedelta(hours=24)]
@@ -716,7 +819,7 @@ def campaign_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
         "generated_at_utc": utc_now_iso(),
         "campaign_evidence": surface(available),
         "daily_diagnostic": surface(daily),
-        "solar": "excluded_until_mpp_active_observed_power_is_available",
+        "solar": "mpp_active_available_power_only",
         "ensemble": "not_generated_in_bounded_initial_candidate",
         "reserve_events": "insufficient_events",
         "evaluation_contract": evaluation_contract,
@@ -878,6 +981,18 @@ def promotion_gate_review(evidence: xr.Dataset) -> dict[str, object]:
             "status": "pass" if (skill is not None and skill >= 0.0) or (low_mae and no_worse_bias) else "fail",
         }
     base["long_lead_soc"] = long_gate
+    solar_metrics = _solar_metric_summary(frame)
+    if solar_metrics.get("status") == "evidence":
+        solar_metrics["required_mae_improvement_fraction"] = 0.10
+        solar_metrics["status"] = (
+            "pass"
+            if float(solar_metrics["mae_improvement_fraction"]) >= 0.10
+            else "fail"
+        )
+    else:
+        solar_metrics["status"] = "blocked_mpp_active_available_power_evidence_unavailable"
+    base["solar"] = solar_metrics
+
     load_metrics = _error_metrics(
         frame,
         candidate="CandidateLoadWatts",
@@ -891,11 +1006,23 @@ def promotion_gate_review(evidence: xr.Dataset) -> dict[str, object]:
         candidate_abs_bias = abs(load_metrics["candidate_bias"])
         load_metrics["status"] = (
             "pass"
-            if load_metrics["mae_improvement_fraction"] >= 0.10
-            and candidate_abs_bias <= (0.90 * baseline_abs_bias if baseline_abs_bias > 0.0 else 0.0)
+            if baseline_abs_bias > 0.0 and candidate_abs_bias <= 0.90 * baseline_abs_bias
             else "fail"
         )
+        load_metrics["required_absolute_bias_improvement_fraction"] = 0.10
+        load_metrics["absolute_bias_improvement_fraction"] = (
+            float(1.0 - candidate_abs_bias / baseline_abs_bias) if baseline_abs_bias > 0.0 else np.nan
+        )
         base["load"] = load_metrics
+    gate_statuses = [
+        str(base["soc"].get("status", "blocked")),
+        *(str(value.get("status", "blocked")) for value in long_gate.values()),
+        str(base["solar"].get("status", "blocked")),
+        str(base["load"].get("status", "blocked")),
+    ]
+    base["quantitative_gates"] = (
+        "pass" if gate_statuses and all(status == "pass" for status in gate_statuses) else "not_all_pass"
+    )
     base["evidence"] = "eligible_for_manual_gate_review"
     # The physical solar and memberwise ensemble gates remain explicit blocks,
     # so this function can never accidentally accept a candidate by itself.

@@ -123,6 +123,12 @@ PDU_OUTLET_KIT_NAMES = {
     6: "Radar",
     8: "HATPRO",
 }
+MPP_ACTIVE_MODE = 2.0
+SOLAR_MPP_MODE_FIELDS = (
+    "SolarMPPMode_East",
+    "SolarMPPMode_South",
+    "SolarMPPMode_West",
+)
 
 
 def resolve_ecmwf_cycle_hour(value: int | str | None, *, now: datetime | None = None) -> int | None:
@@ -789,6 +795,7 @@ def _power_frame(power: xr.Dataset) -> pd.DataFrame:
             "SolarWatts_East",
             "SolarWatts_South",
             "SolarWatts_West",
+            *SOLAR_MPP_MODE_FIELDS,
             "BatteryWatts",
             "ACOutputWatts",
             "DCInverterWatts",
@@ -1161,6 +1168,20 @@ def _observed_solar_w(frame: pd.DataFrame) -> pd.Series:
     return frame[solar_fields].sum(axis=1, min_count=1).clip(lower=0.0)
 
 
+def _mpp_active_available_power_mask(frame: pd.DataFrame) -> pd.Series:
+    """Return times where every metered array can represent available PV.
+
+    Victron charger output is delivered power, not necessarily available panel
+    power.  It is valid as a physical-PV target only while each independently
+    metered charger reports register 791 mode 2 (MPPT active).  A missing or
+    non-finite register is deliberately treated as censored instead of guessed.
+    """
+    if frame.empty or not set(SOLAR_MPP_MODE_FIELDS).issubset(frame.columns):
+        return pd.Series(False, index=frame.index, dtype=bool)
+    modes = frame.loc[:, list(SOLAR_MPP_MODE_FIELDS)].apply(pd.to_numeric, errors="coerce")
+    return modes.eq(MPP_ACTIVE_MODE).all(axis=1)
+
+
 def _solar_product_is_available_power(product: xr.Dataset) -> bool:
     """Return whether solar output is potential PV, not metered delivery."""
     model_name = str(product.attrs.get("solar_model_name", "")).strip().lower()
@@ -1212,14 +1233,50 @@ def _filter_active_forecast_contract(table: pd.DataFrame, archive: xr.Dataset) -
     return filtered
 
 
-def _filter_solar_verification_rows(table: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Exclude potential-PV rows until an MPP-active observation mask exists."""
+def _filter_solar_verification_rows(
+    table: pd.DataFrame,
+    *,
+    mpp_active_mask: pd.Series | None = None,
+    tolerance: pd.Timedelta = pd.Timedelta(minutes=10),
+) -> tuple[pd.DataFrame, int, int]:
+    """Keep physical-PV rows only when all three chargers were MPPT-active.
+
+    Legacy forecasts model delivered charger output and need no MPP filter.
+    Physical forecasts model available PV, so limited output is censored and
+    cannot be used as a truth target.  The returned counts are respectively
+    censored physical rows and eligible physical rows.
+    """
     if table.empty:
-        return table, 0
+        return table, 0, 0
     model = table.get("solar_model_name", pd.Series("", index=table.index)).astype(str).str.lower()
     semantics = table.get("solar_power_semantics", pd.Series("", index=table.index)).astype(str).str.lower()
-    eligible = (model != PHYSICAL_SOLAR_MODEL_NAME) & ~semantics.str.contains("available", regex=False)
-    return table.loc[eligible], int(np.count_nonzero(~eligible.to_numpy(dtype=bool)))
+    physical = (model == PHYSICAL_SOLAR_MODEL_NAME) | semantics.str.contains("available", regex=False)
+    eligible_physical = np.zeros(len(table), dtype=bool)
+    if bool(physical.any()) and mpp_active_mask is not None and not mpp_active_mask.empty:
+        valid_times = pd.DatetimeIndex(table["valid_time"])
+        mpp_at_valid_time = mpp_active_mask.reindex(
+            valid_times,
+            method="nearest",
+            tolerance=tolerance,
+        )
+        eligible_physical = mpp_at_valid_time.eq(True).to_numpy(dtype=bool)
+    eligible = ~physical.to_numpy(dtype=bool) | eligible_physical
+    physical_values = physical.to_numpy(dtype=bool)
+    excluded = int(np.count_nonzero(physical_values & ~eligible_physical))
+    accepted = int(np.count_nonzero(physical_values & eligible_physical))
+    return table.loc[eligible], excluded, accepted
+
+
+def _solar_verification_status(*, excluded: int, accepted_available_power: int) -> str | None:
+    if accepted_available_power:
+        return (
+            "eligible_available_power_mpp_active"
+            if not excluded
+            else "partially_eligible_available_power_mpp_active"
+        )
+    if excluded:
+        return "excluded_available_power_observations_are_censored"
+    return None
 
 
 def _observed_load_w(frame: pd.DataFrame) -> pd.Series:
@@ -1349,18 +1406,35 @@ def evaluate_previous_forecast(previous: xr.Dataset | None, frame: pd.DataFrame)
             metrics["soc_bias_pct_points"] = float(np.mean(errors))
             metrics["soc_sample_count"] = int(np.count_nonzero(valid))
 
-    if "ForecastSolarWatts" in previous and not _solar_product_is_available_power(previous):
+    if "ForecastSolarWatts" in previous:
         forecast_solar = pd.Series(np.asarray(previous["ForecastSolarWatts"].values, dtype=np.float64), index=forecast_times)
         forecast_solar = forecast_solar.loc[valid_forecast]
         observed_solar = _observed_solar_w(frame).reindex(forecast_solar.index, method="nearest", tolerance=pd.Timedelta(minutes=10))
-        valid = np.isfinite(forecast_solar.to_numpy()) & np.isfinite(observed_solar.to_numpy())
+        available_power = _solar_product_is_available_power(previous)
+        if available_power:
+            mpp_active = _mpp_active_available_power_mask(frame).reindex(
+                forecast_solar.index,
+                method="nearest",
+                tolerance=pd.Timedelta(minutes=10),
+            )
+            mpp_eligible = mpp_active.eq(True).to_numpy(dtype=bool)
+        else:
+            mpp_eligible = np.ones(len(forecast_solar), dtype=bool)
+        valid = (
+            np.isfinite(forecast_solar.to_numpy())
+            & np.isfinite(observed_solar.to_numpy())
+            & mpp_eligible
+        )
         if np.count_nonzero(valid) >= 2:
             errors = forecast_solar.to_numpy()[valid] - observed_solar.to_numpy()[valid]
             metrics["solar_mae_w"] = float(np.mean(np.abs(errors)))
             metrics["solar_bias_w"] = float(np.mean(errors))
             metrics["solar_sample_count"] = int(np.count_nonzero(valid))
-    elif "ForecastSolarWatts" in previous:
-        metrics["solar_verification_status"] = "excluded_available_power_observations_are_censored"
+        if available_power:
+            metrics["solar_verification_status"] = _solar_verification_status(
+                excluded=int(np.count_nonzero(~mpp_eligible)),
+                accepted_available_power=int(np.count_nonzero(mpp_eligible)),
+            ) or "excluded_available_power_observations_are_censored"
 
     if "ForecastLoadWatts" in previous:
         forecast_load = pd.Series(np.asarray(previous["ForecastLoadWatts"].values, dtype=np.float64), index=forecast_times)
@@ -1641,9 +1715,17 @@ def evaluate_forecast_archive(archive: xr.Dataset | None, frame: pd.DataFrame) -
             tolerance=tolerance,
         )
         solar_table = _filter_active_forecast_contract(solar_table, archive)
-        solar_table, excluded = _filter_solar_verification_rows(solar_table)
-        if excluded:
-            metrics["solar_verification_status"] = "excluded_available_power_observations_are_censored"
+        solar_table, excluded, accepted = _filter_solar_verification_rows(
+            solar_table,
+            mpp_active_mask=_mpp_active_available_power_mask(frame),
+            tolerance=tolerance,
+        )
+        solar_status = _solar_verification_status(
+            excluded=excluded,
+            accepted_available_power=accepted,
+        )
+        if solar_status is not None:
+            metrics["solar_verification_status"] = solar_status
         if not solar_table.empty:
             _add_error_metrics(
                 metrics,
@@ -1717,11 +1799,17 @@ def evaluate_independent_forecast_archive(archive: xr.Dataset | None, frame: pd.
         if current_load_model:
             table = table[table["load_model_version"] == float(LOAD_MODEL_VERSION)]
         if filter_censored_solar:
-            table, excluded = _filter_solar_verification_rows(table)
-            if excluded:
-                metrics["solar_verification_status"] = (
-                    "excluded_available_power_observations_are_censored"
-                )
+            table, excluded, accepted = _filter_solar_verification_rows(
+                table,
+                mpp_active_mask=_mpp_active_available_power_mask(frame),
+                tolerance=tolerance,
+            )
+            solar_status = _solar_verification_status(
+                excluded=excluded,
+                accepted_available_power=accepted,
+            )
+            if solar_status is not None:
+                metrics["solar_verification_status"] = solar_status
         table = _independent_verification_rows(table)
         if table.empty:
             return
@@ -1843,6 +1931,7 @@ def build_forecast_skill_dataset(
     tolerance = pd.Timedelta(minutes=10)
     pieces: dict[str, pd.DataFrame] = {}
     excluded_solar_rows = 0
+    accepted_available_solar_rows = 0
     if "BatterySOC" in frame:
         pieces["soc"] = _filter_active_forecast_contract(_archive_verification_frame(
             archive,
@@ -1858,7 +1947,11 @@ def build_forecast_skill_dataset(
             forecast_var="ForecastSolarWatts",
             tolerance=tolerance,
         ), archive)
-        solar_table, excluded_solar_rows = _filter_solar_verification_rows(solar_table)
+        solar_table, excluded_solar_rows, accepted_available_solar_rows = _filter_solar_verification_rows(
+            solar_table,
+            mpp_active_mask=_mpp_active_available_power_mask(frame),
+            tolerance=tolerance,
+        )
         pieces["solar"] = solar_table
     observed_load = _observed_load_w(frame)
     if not observed_load.empty:
@@ -2052,12 +2145,14 @@ def build_forecast_skill_dataset(
             "target_minimum_independent_cycles": str(int(FORECAST_TARGET_MIN_CYCLES)),
             "target_minimum_verified_samples": str(int(FORECAST_TARGET_MIN_SAMPLES)),
             "solar_verification_status": (
-                "excluded_available_power_observations_are_censored"
-                if excluded_solar_rows
-                else "eligible_delivered_power_baseline"
+                _solar_verification_status(
+                    excluded=excluded_solar_rows,
+                    accepted_available_power=accepted_available_solar_rows,
+                )
+                or "eligible_delivered_power_baseline"
             ),
             "solar_verification_exclusion_reason": (
-                "Victron MPP mode register 791 is not archived, so observed charger output cannot verify available PV"
+                "Observed charger output was limited or MPP register 791 was unavailable; it cannot verify available PV"
                 if excluded_solar_rows
                 else ""
             ),

@@ -19,6 +19,9 @@ def test_issue_time_snapshot_excludes_future_local_observations_and_late_public_
             "BatterySOC": (("time",), [70.0, 1.0]),
             "BatteryWatts": (("time",), [-120.0, -999.0]),
             "ACOutputWatts": (("time",), [200.0, 999.0]),
+            "SolarMPPMode_East": (("time",), [2.0, 1.0]),
+            "SolarMPPMode_South": (("time",), [2.0, 1.0]),
+            "SolarMPPMode_West": (("time",), [2.0, 1.0]),
         },
         coords={"time": times},
     )
@@ -74,6 +77,7 @@ def test_issue_time_snapshot_excludes_future_local_observations_and_late_public_
         )
     features = snapshot.manifest["features"]
     assert features["aps"]["fields"]["BatterySOC"]["latest"] == 70.0
+    assert features["aps"]["fields"]["SolarMPPMode_East"]["latest"] == 2.0
     assert features["asfs"]["fields"]["sr30_swd_Irr_Avg"]["latest"] == 123.0
     assert features["menapia"]["dock_pair_state"] == "dock1_5__dock2_5"
     assert snapshot.manifest["public_model_ablations"]["gfs"]["status"] == (

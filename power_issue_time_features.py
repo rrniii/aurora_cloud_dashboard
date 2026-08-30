@@ -35,6 +35,11 @@ APS_FIELDS = (
     "SolarWatts_East",
     "SolarWatts_South",
     "SolarWatts_West",
+    # Victron register 791: 0=off, 1=voltage/current limited, 2=MPPT
+    # active.  These are observational eligibility flags, not predictors.
+    "SolarMPPMode_East",
+    "SolarMPPMode_South",
+    "SolarMPPMode_West",
 )
 ASFS_FIELDS = (
     "sr30_swd_Irr_Avg",

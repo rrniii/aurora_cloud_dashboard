@@ -71,11 +71,13 @@ shortwave-derived albedo, but it declares Erbs decomposition, disabled
 temperature correction and fixed albedo as degradation codes when those fields
 are absent.
 
-Residual solar calibration is disabled for the candidate. Local acquisition
-support now names Victron register 791 as `SolarMPPMode_East/South/West`, but it
-is not deployed or present in the historical archive yet. Recent chargers have
-been observed in voltage/current-limited operation. Learning available PV from
-those censored measurements would bias the physical model low.
+Residual solar calibration is disabled for the candidate. The prepared
+real-time acquisition change defines Victron register 791 as
+`SolarMPPMode_East/South/West`; it must be released through the normal edge
+path before new values reach the power archive. Historical archive rows do not
+contain it. Recent chargers have been observed in voltage/current-limited
+operation. Learning available PV from those censored measurements would bias
+the physical model low.
 
 ## Isolated paired evaluation
 
@@ -111,8 +113,9 @@ before the whole bundle is atomically made visible; paired evaluators must
 accept only manifests with `pair_status = complete`.
 
 SOC and load can be evaluated from the isolated candidate archive. Direct PV
-skill is explicitly withheld until register 791 supplies an uncurtailed
-verification mask. Promotion requires:
+skill is scored only where register 791 reports MPPT-active operation for all
+three chargers; all other delivered-power rows remain censored. Promotion
+requires:
 
 - a surveyed array/controller configuration or an issue-time-safe fit from
   MPP-active samples;

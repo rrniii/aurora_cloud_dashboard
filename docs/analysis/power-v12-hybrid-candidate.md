@@ -91,8 +91,11 @@ cycles in every lead bucket across at least ten UTC days and has passed the
 specified SOC, solar, load, calibration, reproducibility, resource and API
 gates.  There is no automatic promotion path in v12.
 
-Direct solar skill remains withheld until Victron MPP mode (register 791) is
-available to exclude charger-limited observations.  Ensemble and reserve-event
+Direct solar skill is calculated only for records where all three Victron MPP
+mode-791 channels report `2` (MPPT active).  A limited, off, missing, or stale
+channel makes that delivered-power sample censored and excludes it; it never
+appears as a physical-PV model miss.  Until enough such records arrive, the
+solar promotion gate stays explicitly blocked. Ensemble and reserve-event
 metrics are explicitly marked unavailable in this initial bounded candidate;
 their absence prevents acceptance rather than being hidden in an aggregate.
 

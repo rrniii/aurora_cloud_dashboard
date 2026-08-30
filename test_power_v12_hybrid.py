@@ -21,7 +21,12 @@ from generate_power_soc_forecast import (
 )
 from generate_power_soc_v12_candidate import run_candidate
 from power_load_dynamics import ControlledLoadProfile
-from power_v12_hybrid import build_campaign_evidence, evaluation_contract_from_forecast, fit_bounded_load_residual
+from power_v12_hybrid import (
+    build_campaign_evidence,
+    campaign_score_surfaces,
+    evaluation_contract_from_forecast,
+    fit_bounded_load_residual,
+)
 
 
 CONFIG_PATH = Path(__file__).with_name("config") / "power_solar_physical_candidate_v1.json"
@@ -364,3 +369,40 @@ class HybridCandidateTests(unittest.TestCase):
             )
         self.assertEqual(evidence.sizes["record"], 2)
         self.assertEqual(evidence.attrs["incompatible_pair_count"], 1)
+
+    def test_campaign_surface_reports_mpp_active_physical_solar_skill(self) -> None:
+        issue = pd.Timestamp("2026-06-01T00:00:00")
+        evidence = xr.Dataset(
+            {
+                "IssueTime": (("record",), [issue.to_datetime64(), issue.to_datetime64()]),
+                "ValidTime": (("record",), [
+                    issue.to_datetime64(),
+                    (issue + pd.Timedelta(hours=3)).to_datetime64(),
+                ]),
+                "LeadHours": (("record",), [0.0, 3.0]),
+                "SOCAuthoringAnchor": (("record",), [80.0, 80.0]),
+                "CandidateSOC": (("record",), [80.0, 79.0]),
+                "BaselineSOC": (("record",), [80.0, 79.0]),
+                "ObservedSOC": (("record",), [80.0, 79.0]),
+                "CandidateLoadWatts": (("record",), [100.0, 100.0]),
+                "BaselineLoadWatts": (("record",), [100.0, 100.0]),
+                "ObservedLoadWatts": (("record",), [100.0, 100.0]),
+                "CandidateSolarWatts": (("record",), [900.0, 900.0]),
+                "BaselineSolarWatts": (("record",), [600.0, 600.0]),
+                "ObservedSolarWatts": (("record",), [900.0, 900.0]),
+                "SolarEvaluationAvailable": (("record",), [True, True]),
+                "EvaluationAvailable": (("record",), [True, True]),
+                "LoadMode": (("record",), ["DC-Only", "DC-Only"]),
+                "CloudRegime": (("record",), ["dark", "dark"]),
+                "SourceAvailability": (("record",), ["ecmwf", "ecmwf"]),
+                "DegradedModeCode": (("record",), ["none", "none"]),
+            },
+            coords={"record": [0, 1]},
+        )
+
+        summary = campaign_score_surfaces(evidence)
+
+        solar = summary["campaign_evidence"]["solar"]
+        self.assertEqual(solar["status"], "evidence")
+        self.assertEqual(solar["candidate_mae"], 0.0)
+        self.assertEqual(solar["baseline_mae"], 300.0)

@@ -501,6 +501,61 @@ class PhysicalSolarIntegrationTests(unittest.TestCase):
                 "excluded_available_power_observations_are_censored",
             )
 
+    def test_candidate_skill_scores_available_pv_only_when_all_arrays_are_mpp_active(self) -> None:
+        issue = pd.Timestamp("2026-06-21T12:00:00")
+        forecast = xr.Dataset(
+            {
+                "BatterySOCForecast": (("time",), [70.0, 69.0]),
+                "ForecastSolarWatts": (("time",), [900.0, 900.0]),
+                "ForecastLoadWatts": (("time",), [100.0, 100.0]),
+            },
+            coords={"time": [issue, issue + pd.Timedelta(hours=3)]},
+            attrs={
+                "initial_soc_time": issue.isoformat(),
+                "ecmwf_cycle_time": issue.isoformat(),
+                "solar_model_name": PHYSICAL_SOLAR_MODEL_NAME,
+                "solar_power_semantics": "available_dc_before_battery_acceptance",
+            },
+        )
+        archive = _archive_row_from_forecast(forecast)
+        observed_times = pd.date_range(issue, issue + pd.Timedelta(hours=3), freq="10min")
+        power = xr.Dataset(
+            {
+                "BatterySOC": (("time",), np.linspace(70.0, 69.0, len(observed_times))),
+                "SolarWatts_East": (("time",), np.full(len(observed_times), 300.0)),
+                "SolarWatts_South": (("time",), np.full(len(observed_times), 300.0)),
+                "SolarWatts_West": (("time",), np.full(len(observed_times), 300.0)),
+                "SolarMPPMode_East": (("time",), np.full(len(observed_times), 2.0)),
+                "SolarMPPMode_South": (("time",), np.full(len(observed_times), 2.0)),
+                "SolarMPPMode_West": (("time",), np.full(len(observed_times), 2.0)),
+                "ACOutputWatts": (("time",), np.full(len(observed_times), 90.0)),
+                "DCInverterWatts": (("time",), np.full(len(observed_times), 10.0)),
+            },
+            coords={"time": observed_times},
+        )
+
+        skill = build_forecast_skill_dataset(
+            archive,
+            power,
+            window_hours=6,
+            retention_days=1,
+            freq="1h",
+        )
+
+        self.assertEqual(skill.attrs["solar_verification_status"], "eligible_available_power_mpp_active")
+        self.assertTrue(np.isfinite(skill["ForecastSolarMAE24h"].values).any())
+
+        frame = pd.DataFrame(
+            {name: power[name].values for name in power.data_vars},
+            index=observed_times,
+        )
+        previous_metrics = evaluate_previous_forecast(forecast, frame)
+        archive_metrics = evaluate_forecast_archive(archive, frame)
+        independent_metrics = evaluate_independent_forecast_archive(archive, frame)
+        for metrics in (previous_metrics, archive_metrics, independent_metrics):
+            self.assertEqual(metrics["solar_verification_status"], "eligible_available_power_mpp_active")
+            self.assertEqual(metrics["solar_mae_w"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
