@@ -58,12 +58,18 @@ Cloudnet, HATPRO, radar, ceilometer and camera products are explicitly marked
 retrospective or latency-replay-only. They are never read by the v12 forecast
 writer as if they were live observations.
 
-ECMWF is the only active weather forcing in this initial candidate. IFS, GFS,
+ECMWF remains the only active weather forcing in the B/C/D candidate. IFS, GFS,
 ICON and GEFS each have a separate, fail-closed site-manifest slot under
-`/data/aurora/dev-products/power/public_model_inputs`. A manifest must record a
-site extraction checksum, source cycle and real delivery time at or before the
-issue time. Such a source is still `pending_independent_ablation`; it is never
-pooled with ECMWF or imported from `/data/aurora/model-evaluation`.
+`/data/aurora/dev-products/power/public_model_inputs`. A version-2 manifest
+must identify an immutable local Zarr/NetCDF extract, its SHA-256, exact site
+coordinates, source cycle, real delivery time, irradiance variable, and an
+explicit `global_grid_retained: false` declaration. The consumer re-hashes it,
+rejects any spatial dimension, requires the exact paired output grid, and
+writes a separate physical-PV candidate under
+`public_model_ablations/<source>/`. GEFS may use only its own on-time local
+members (an explicitly labelled internal-member mean); sources are never pooled
+with one another or with ECMWF, and nothing is imported from
+`/data/aurora/model-evaluation`.
 
 Completed baseline/candidate pairs are immutable directories at:
 
@@ -92,18 +98,27 @@ specified SOC, solar, load, calibration, reproducibility, resource and API
 gates.  There is no automatic promotion path in v12.
 
 Direct solar skill is calculated only for records where all three Victron MPP
-mode-791 channels report `2` (MPPT active).  A limited, off, missing, or stale
+mode-791 channels report `2` (MPPT active). A limited, off, missing, or stale
 channel makes that delivered-power sample censored and excludes it; it never
-appears as a physical-PV model miss.  Until enough such records arrive, the
-solar promotion gate stays explicitly blocked. Ensemble and reserve-event
-metrics are explicitly marked unavailable in this initial bounded candidate;
-their absence prevents acceptance rather than being hidden in an aggregate.
+appears as a physical-PV model miss. Until enough such records arrive, the
+solar promotion gate stays explicitly blocked.
+
+The baseline ECMWF site ensemble is also read-only. Every B/C/D lane propagates
+the same members through its candidate calculation: B/D use ten-minute
+physical-PV battery integration; C/D preserve the baseline member load spread
+and apply only the deterministic bounded-residual delta. Candidate ensembles,
+archives and pairs have their own semantic contract directory, content
+signature and immutable `ensemble_pairs/<pair-id>/<signature>/` bundle. The
+campaign product calculates CRPS against both v10/v11 baseline members and SOC
+persistence, P10--P90 coverage, and reserve-event Brier skill. Coverage must
+be 75--90%; reserve evidence with fewer than ten events is reported as
+`insufficient_events`, never invented or silently passed.
 
 `promotion_gates` in the candidate status/review record materialises the
 quantitative 0--24 h, long-lead, load, solar, ensemble and reserve-event rules.
-It is a manual review aid only: insufficient MPP-active solar data, no
-member-wise physical ensemble, or insufficient independent cycles are explicit
-blocks and cannot produce an automatic promotion.
+It is a manual review aid only: insufficient MPP-active solar data, an absent
+or non-identical member-wise baseline ensemble, or insufficient independent
+cycles are explicit blocks and cannot produce an automatic promotion.
 
 ## Development and iOS exposure
 

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from power_issue_time_features import build_issue_time_feature_snapshot
+from power_issue_time_features import build_issue_time_feature_snapshot, site_extract_sha256
 
 
 def test_issue_time_snapshot_excludes_future_local_observations_and_late_public_source():
@@ -54,15 +54,25 @@ def test_issue_time_snapshot_excludes_future_local_observations_and_late_public_
             encoding="utf-8",
         )
         source_root.mkdir()
+        extract = source_root / "gfs.zarr"
+        xr.Dataset(
+            {"ghi_w_m2": (("time",), np.asarray([10.0, 20.0]))}, coords={"time": times}
+        ).to_zarr(extract, mode="w", consolidated=True)
         (source_root / "gfs.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "site-extracted-public-source-v1",
+                    "schema_version": "site-extracted-public-source-v2",
                     "source": "GFS",
                     "site_extract_only": True,
+                    "global_grid_retained": False,
                     "source_cycle_time_utc": "2026-08-29T06:00:00Z",
                     "delivery_time_utc": "2026-08-29T12:05:00Z",
-                    "site_extract_sha256": "a" * 64,
+                    "site_extract_path": "gfs.zarr",
+                    "site_extract_format": "zarr",
+                    "irradiance_variable": "ghi_w_m2",
+                    "site_latitude": 64.829694,
+                    "site_longitude": -23.248139,
+                    "site_extract_sha256": site_extract_sha256(extract),
                 }
             ),
             encoding="utf-8",
@@ -97,15 +107,25 @@ def test_issue_time_snapshot_marks_on_time_public_source_ablation_without_poolin
     )
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
+        extract = root / "ifs.zarr"
+        xr.Dataset(
+            {"ghi_w_m2": (("time",), np.asarray([10.0, 20.0]))}, coords={"time": times}
+        ).to_zarr(extract, mode="w", consolidated=True)
         (root / "ifs.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "site-extracted-public-source-v1",
+                    "schema_version": "site-extracted-public-source-v2",
                     "source": "IFS",
                     "site_extract_only": True,
+                    "global_grid_retained": False,
                     "source_cycle_time_utc": "2026-08-29T06:00:00Z",
                     "delivery_time_utc": "2026-08-29T11:45:00Z",
-                    "site_extract_sha256": "b" * 64,
+                    "site_extract_path": "ifs.zarr",
+                    "site_extract_format": "zarr",
+                    "irradiance_variable": "ghi_w_m2",
+                    "site_latitude": 64.829694,
+                    "site_longitude": -23.248139,
+                    "site_extract_sha256": site_extract_sha256(extract),
                 }
             ),
             encoding="utf-8",

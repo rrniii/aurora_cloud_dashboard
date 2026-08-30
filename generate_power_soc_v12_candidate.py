@@ -44,6 +44,17 @@ from power_issue_time_features import (
     IssueTimeFeatureSnapshot,
     build_issue_time_feature_snapshot,
 )
+from power_public_source_ablation import run_public_source_ablations
+from power_v12_ensemble import (
+    append_candidate_ensemble_archive,
+    baseline_ensemble_signature,
+    build_candidate_memberwise_ensemble,
+    build_campaign_ensemble_evidence,
+    campaign_ensemble_score_surfaces,
+    ensemble_evaluation_contract_from_forecast,
+    ensemble_promotion_gate,
+    write_immutable_ensemble_pair_bundle,
+)
 from power_v12_hybrid import (
     build_campaign_evidence,
     campaign_score_surfaces,
@@ -68,6 +79,12 @@ BASELINE_ARCHIVE_ZARR_PATH = Path(
     os.environ.get(
         "AURORA_POWER_BASELINE_FORECAST_ARCHIVE_ZARR",
         "/data/aurora/dev-products/power/power_soc_forecast_archive.zarr",
+    )
+)
+BASELINE_ENSEMBLE_ZARR_PATH = Path(
+    os.environ.get(
+        "AURORA_POWER_BASELINE_ENSEMBLE_ZARR",
+        "/data/aurora/dev-products/power/power_soc_ensemble_forecast.zarr",
     )
 )
 CANDIDATE_ROOT = Path(
@@ -113,6 +130,22 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _public_source_manifest_root_digest(root: Path) -> str:
+    """Track compact source manifests so a newly enrolled source is not skipped."""
+    root = Path(root)
+    if not root.exists():
+        return "missing"
+    digest = hashlib.sha256()
+    found = False
+    for path in sorted(root.glob("*.json")):
+        if not path.is_file():
+            continue
+        found = True
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return "sha256:" + digest.hexdigest() if found else "empty"
 
 
 def _utc_naive(value: object) -> pd.Timestamp:
@@ -395,10 +428,46 @@ def _lane_result_path(root: Path, lane: str) -> Path:
     return root / "lanes" / lane / "power_soc_forecast.zarr"
 
 
+def _candidate_ensemble_paths(lane_root: Path, contract_id: str) -> dict[str, Path]:
+    """Keep each semantic member-wise contract in its own candidate directory."""
+    root = lane_root / "ensemble_contracts" / contract_id
+    return {
+        "forecast": root / "power_soc_ensemble_forecast.zarr",
+        "archive": root / "power_soc_ensemble_archive.zarr",
+        "evidence": root / "campaign_ensemble_evidence.zarr",
+        "summary": root / "campaign_ensemble_summary.json",
+        "gate": root / "promotion_ensemble_gate.json",
+    }
+
+
+def _load_baseline_ensemble(path: Path | None) -> tuple[xr.Dataset | None, str, str]:
+    """Load a read-only site ensemble without blocking deterministic evidence."""
+    if path is None:
+        return None, "", "blocked_baseline_ensemble_not_configured"
+    path = Path(path)
+    if not path.exists():
+        return None, "", "blocked_baseline_ensemble_missing"
+    try:
+        with xr.open_zarr(path, chunks={}) as opened:
+            ensemble = opened.load()
+        return ensemble, baseline_ensemble_signature(ensemble), "available"
+    except Exception as exc:
+        return None, "", f"blocked_baseline_ensemble_invalid:{type(exc).__name__}"
+
+
+def _verify_baseline_ensemble_unchanged(path: Path, expected_signature: str) -> None:
+    """Detect a late baseline ensemble refresh before candidate publication."""
+    refreshed, signature, status = _load_baseline_ensemble(path)
+    del refreshed
+    if status != "available" or signature != expected_signature:
+        raise RuntimeError("Baseline ensemble changed during candidate member-wise generation")
+
+
 def run_candidate(
     *,
     baseline_forecast_zarr: Path = BASELINE_FORECAST_ZARR_PATH,
     baseline_archive_zarr: Path = BASELINE_ARCHIVE_ZARR_PATH,
+    baseline_ensemble_zarr: Path | None = BASELINE_ENSEMBLE_ZARR_PATH,
     candidate_root: Path = CANDIDATE_ROOT,
     power_zarr: Path = POWER_ZARR_PATH,
     pdu_zarr: Path = POWER_PDU_ZARR_PATH,
@@ -410,13 +479,27 @@ def run_candidate(
     """Generate lanes B/C/D for one verified v10/v11 ECMWF baseline issue."""
     baseline_forecast_zarr = Path(baseline_forecast_zarr)
     baseline_archive_zarr = Path(baseline_archive_zarr)
+    baseline_ensemble_zarr = (
+        Path(baseline_ensemble_zarr) if baseline_ensemble_zarr is not None else None
+    )
     candidate_root = Path(candidate_root)
     asfs_zarr = Path(asfs_zarr)
     menapia_mqtt_log = Path(menapia_mqtt_log)
     public_source_manifest_root = Path(public_source_manifest_root)
     if any(path.suffix.lower() == ".zarr" for path in (candidate_root, *candidate_root.parents)):
         raise ValueError("v12 candidate root cannot be inside a Zarr store")
-    protected = (baseline_forecast_zarr, baseline_archive_zarr, power_zarr, pdu_zarr, asfs_zarr)
+    protected = tuple(
+        path
+        for path in (
+            baseline_forecast_zarr,
+            baseline_archive_zarr,
+            baseline_ensemble_zarr,
+            power_zarr,
+            pdu_zarr,
+            asfs_zarr,
+        )
+        if path is not None
+    )
     if any(_paths_overlap(candidate_root, path) for path in protected):
         raise ValueError("v12 candidate root overlaps a protected baseline or input product")
     if not baseline_forecast_zarr.exists():
@@ -456,6 +539,12 @@ def run_candidate(
     input_digest = _sha256_file(input_forecast)
     baseline_control_contract_id, baseline_control_system_version = _baseline_control_identity(attrs)
     code_revision = _code_revision()
+    baseline_ensemble, baseline_ensemble_signature_value, ensemble_input_status = (
+        _load_baseline_ensemble(baseline_ensemble_zarr)
+    )
+    public_source_manifest_root_digest = _public_source_manifest_root_digest(
+        public_source_manifest_root
+    )
     existing_status = _read_json(candidate_root / "status.json")
     if (
         existing_status
@@ -466,6 +555,10 @@ def run_candidate(
         and existing_status.get("physical_solar_config_sha256") == config_digest
         and existing_status.get("baseline_control_contract_id") == baseline_control_contract_id
         and existing_status.get("baseline_control_system_version") == baseline_control_system_version
+        and existing_status.get("baseline_ensemble_signature") == baseline_ensemble_signature_value
+        and existing_status.get("memberwise_ensemble_input_status") == ensemble_input_status
+        and existing_status.get("public_source_manifest_root_digest")
+        == public_source_manifest_root_digest
     ):
         return {
             lane: _lane_result_path(candidate_root, lane)
@@ -526,6 +619,7 @@ def run_candidate(
     lane_signatures: dict[str, str] = {}
     lane_summaries: dict[str, dict[str, object]] = {}
     lane_promotion_gates: dict[str, dict[str, object]] = {}
+    lane_ensemble_summaries: dict[str, dict[str, object]] = {}
     lane_specs = (
         (LANE_PHYSICAL_SOLAR, PHYSICAL_SOLAR_MODEL_NAME, None, True, False),
         (LANE_LOAD_RESIDUAL, LEGACY_SOLAR_MODEL_NAME, residual.as_profile(), False, True),
@@ -637,13 +731,88 @@ def run_candidate(
         )
         _atomic_write_zarr(evidence, lane_root / "campaign_evidence.zarr")
         summary = campaign_score_surfaces(evidence)
-        gates = promotion_gate_review(evidence)
+        ensemble_summary: dict[str, object] = {
+            "status": ensemble_input_status,
+            "reason": "Baseline ensemble is read-only and optional for deterministic candidate evidence.",
+        }
+        ensemble_gate: dict[str, object] | None = None
+        if baseline_ensemble is not None and baseline_ensemble_zarr is not None:
+            try:
+                candidate_ensemble = build_candidate_memberwise_ensemble(
+                    baseline,
+                    candidate,
+                    baseline_ensemble,
+                    lane=lane,
+                    physical_config=configuration,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+                ensemble_contract = str(
+                    candidate_ensemble.attrs["candidate_ensemble_contract_id"]
+                )
+                ensemble_paths = _candidate_ensemble_paths(lane_root, ensemble_contract)
+                # Re-read and hash the site-member input before any candidate
+                # ensemble writer or completion manifest is exposed.
+                _verify_baseline_ensemble_unchanged(
+                    baseline_ensemble_zarr, baseline_ensemble_signature_value
+                )
+                _atomic_write_zarr(candidate_ensemble, ensemble_paths["forecast"])
+                append_candidate_ensemble_archive(
+                    candidate_ensemble, ensemble_paths["archive"]
+                )
+                write_immutable_ensemble_pair_bundle(
+                    lane_root,
+                    deterministic_pair_id=pair_id,
+                    baseline_ensemble=baseline_ensemble,
+                    candidate_ensemble=candidate_ensemble,
+                    manifest_extra={
+                        "baseline_publication_signature": baseline_signature,
+                        "source_manifest_digest": source_manifest_digest,
+                        "source_cycle_set_id": source_cycle_set_id,
+                        "input_snapshot_id": f"sha256:{input_digest}",
+                    },
+                )
+                ensemble_evidence = build_campaign_ensemble_evidence(
+                    lane_root / "ensemble_pairs",
+                    power_for_fit,
+                    lane=lane,
+                    evaluation_contract=ensemble_evaluation_contract_from_forecast(
+                        candidate_ensemble
+                    ),
+                )
+                _atomic_write_zarr(ensemble_evidence, ensemble_paths["evidence"])
+                ensemble_summary = campaign_ensemble_score_surfaces(ensemble_evidence)
+                ensemble_gate = ensemble_promotion_gate(ensemble_evidence)
+                ensemble_summary["promotion_gate"] = ensemble_gate
+                ensemble_summary["status"] = "complete"
+                ensemble_summary["candidate_ensemble_contract_id"] = ensemble_contract
+                _atomic_json(ensemble_paths["summary"], ensemble_summary)
+                _atomic_json(ensemble_paths["gate"], ensemble_gate)
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                ensemble_summary = {
+                    "status": f"blocked_memberwise_candidate_error:{type(exc).__name__}",
+                    "reason": str(exc),
+                }
+                ensemble_gate = None
+        gates = promotion_gate_review(evidence, ensemble_gate=ensemble_gate)
         summary["promotion_gates"] = gates
+        summary["memberwise_ensemble"] = ensemble_summary
         _atomic_json(lane_root / "evaluation_summary.json", summary)
         results[lane] = output
         lane_signatures[lane] = str(candidate.attrs.get("publication_signature", ""))
         lane_summaries[lane] = summary
         lane_promotion_gates[lane] = gates
+        lane_ensemble_summaries[lane] = ensemble_summary
+    public_source_results = run_public_source_ablations(
+        candidate_root=candidate_root,
+        baseline=baseline,
+        power_for_evidence=power_for_fit,
+        source_manifest_root=public_source_manifest_root,
+        configuration=configuration,
+        latitude=latitude,
+        longitude=longitude,
+        code_revision=code_revision,
+    )
     status = {
         "schema_version": 1,
         "environment": "development",
@@ -661,10 +830,15 @@ def run_candidate(
         "physical_solar_config_sha256": config_digest,
         "baseline_control_contract_id": baseline_control_contract_id,
         "baseline_control_system_version": baseline_control_system_version,
+        "baseline_ensemble_path": str(baseline_ensemble_zarr or ""),
+        "baseline_ensemble_signature": baseline_ensemble_signature_value,
+        "memberwise_ensemble_input_status": ensemble_input_status,
+        "public_source_manifest_root_digest": public_source_manifest_root_digest,
         "issue_time_feature_contract_id": feature_snapshot.contract_id,
         "issue_time_feature_snapshot_digest": f"sha256:{feature_snapshot.snapshot_digest}",
         "source_availability_code": feature_snapshot.source_availability_code,
         "public_model_ablations": feature_snapshot.manifest["public_model_ablations"],
+        "public_model_ablation_results": public_source_results,
         "load_residual": {
             "status": residual.status,
             "contract_id": residual.contract_id,
@@ -676,6 +850,7 @@ def run_candidate(
             lane: {
                 "path": str(path),
                 "publication_signature": lane_signatures[lane],
+                "memberwise_ensemble": lane_ensemble_summaries.get(lane, {}),
             }
             for lane, path in results.items()
         },
@@ -706,7 +881,7 @@ def run_candidate(
                 "paired_independent_cycles": "minimum 30 per lead bucket across 10 UTC days",
                 "soc_skill": "review campaign evidence against v10 and persistence",
                 "solar_and_load": "review only issue-time-safe, uncensored metrics",
-                "ensemble": "not_generated_in_bounded_initial_candidate",
+                "ensemble": "memberwise candidate ensemble required; status is recorded per lane",
                 "reserve_events": "insufficient_events unless an event sample is available",
                 "operational_safety": "memory, runtime, reproducibility and API compatibility must pass",
             },
@@ -727,10 +902,12 @@ def run_candidate(
                 "contract_id": feature_snapshot.contract_id,
                 "snapshot_digest": f"sha256:{feature_snapshot.snapshot_digest}",
                 "source_availability_code": feature_snapshot.source_availability_code,
-                "public_model_ablations": feature_snapshot.manifest["public_model_ablations"],
+            "public_model_ablations": feature_snapshot.manifest["public_model_ablations"],
+            "public_model_ablation_results": public_source_results,
             },
             "load_residual": status["load_residual"],
             "lanes": lane_summaries,
+            "memberwise_ensemble_input_status": ensemble_input_status,
             "promotion_gates": lane_promotion_gates.get(LANE_HYBRID, {}),
             "next_action": "Accumulate paired independent ECMWF-cycle evidence; do not promote from rolling diagnostics.",
         },
@@ -744,6 +921,10 @@ def run_candidate(
             "source_manifest_digest": source_manifest_digest,
             "lanes": sorted(results),
             "load_residual_status": residual.status,
+            "public_model_ablation_results": {
+                source: result.get("status", "unknown")
+                for source, result in public_source_results.items()
+            },
         },
     )
     return results
@@ -753,6 +934,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate issue-time-paired v12 hybrid power candidates")
     parser.add_argument("--baseline-forecast-zarr", type=Path, default=BASELINE_FORECAST_ZARR_PATH)
     parser.add_argument("--baseline-archive-zarr", type=Path, default=BASELINE_ARCHIVE_ZARR_PATH)
+    parser.add_argument("--baseline-ensemble-zarr", type=Path, default=BASELINE_ENSEMBLE_ZARR_PATH)
     parser.add_argument("--candidate-root", type=Path, default=CANDIDATE_ROOT)
     parser.add_argument("--power-zarr", type=Path, default=POWER_ZARR_PATH)
     parser.add_argument("--pdu-zarr", type=Path, default=POWER_PDU_ZARR_PATH)
@@ -768,6 +950,7 @@ def main() -> None:
     results = run_candidate(
         baseline_forecast_zarr=args.baseline_forecast_zarr,
         baseline_archive_zarr=args.baseline_archive_zarr,
+        baseline_ensemble_zarr=args.baseline_ensemble_zarr,
         candidate_root=args.candidate_root,
         power_zarr=args.power_zarr,
         pdu_zarr=args.pdu_zarr,

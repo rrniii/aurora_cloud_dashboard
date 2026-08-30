@@ -89,7 +89,10 @@ def _observed_load_w(power: xr.Dataset) -> pd.Series:
             return balanced
     load_fields = [name for name in ("ACOutputWatts", "DCInverterWatts") if name in frame]
     if not load_fields:
-        return pd.Series(dtype=np.float64)
+        # Preserve the temporal index so evidence construction can safely mark
+        # load skill unavailable instead of attempting nearest reindexing on a
+        # RangeIndex when a minimal SOC-only observation product is supplied.
+        return pd.Series(np.nan, index=frame.index, dtype=np.float64)
     return frame[load_fields].sum(axis=1, min_count=1).clip(lower=0.0)
 
 
@@ -597,7 +600,22 @@ def build_campaign_evidence(
         baseline_load = np.asarray(baseline.get("ForecastLoadWatts", xr.DataArray(np.full(len(times), np.nan))).values, dtype=np.float64)
         candidate_solar = np.asarray(candidate.get("ForecastSolarWatts", xr.DataArray(np.full(len(times), np.nan))).values, dtype=np.float64)
         baseline_solar = np.asarray(baseline.get("ForecastSolarWatts", xr.DataArray(np.full(len(times), np.nan))).values, dtype=np.float64)
-        ghi = np.asarray(candidate.get("ECMWFSolarIrradiance", xr.DataArray(np.full(len(times), np.nan))).values, dtype=np.float64)
+        forcing_name = (
+            "ForecastInputGlobalHorizontalIrradiance"
+            if "ForecastInputGlobalHorizontalIrradiance" in candidate
+            else "ECMWFSolarIrradiance"
+        )
+        ghi = np.asarray(
+            candidate.get(forcing_name, xr.DataArray(np.full(len(times), np.nan))).values,
+            dtype=np.float64,
+        )
+        cloud_regime_method = _pair_text(
+            candidate,
+            "cloud_regime_proxy_method",
+            "ecmwf_ghi_proxy_not_delayed_cloud_product"
+            if forcing_name == "ECMWFSolarIrradiance"
+            else "source_ghi_proxy_not_delayed_cloud_product",
+        )
         observed_soc_values = observed_soc.reindex(
             times, method="nearest", tolerance=pd.Timedelta(minutes=10)
         ).to_numpy(dtype=np.float64)
@@ -633,7 +651,7 @@ def build_campaign_evidence(
                     "SourceCycleSetID": _pair_text(candidate, "source_cycle_set_id"),
                     "LoadMode": _pair_text(candidate, "load_mode", "unknown"),
                     "CloudRegime": _irradiance_regime(float(ghi[index])),
-                    "CloudRegimeMethod": "ecmwf_ghi_proxy_not_delayed_cloud_product",
+                    "CloudRegimeMethod": cloud_regime_method,
                     "SourceAvailability": _pair_text(
                         candidate,
                         "source_availability_code",
@@ -856,7 +874,11 @@ def _error_metrics(
     }
 
 
-def promotion_gate_review(evidence: xr.Dataset) -> dict[str, object]:
+def promotion_gate_review(
+    evidence: xr.Dataset,
+    *,
+    ensemble_gate: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Materialise the specified manual-promotion gates without auto-promoting.
 
     A missing eligible solar/ensemble/release-test input is intentionally a
@@ -876,6 +898,11 @@ def promotion_gate_review(evidence: xr.Dataset) -> dict[str, object]:
         "reserve_events": "insufficient_events",
         "release_tests": "external_reproducibility_resource_and_api_checks_required",
     }
+    if ensemble_gate is not None:
+        base["ensemble"] = dict(ensemble_gate)
+        base["reserve_events"] = str(
+            ensemble_gate.get("reserve_events", "insufficient_events")
+        )
     if evidence.sizes.get("record", 0) == 0 or "EvaluationAvailable" not in evidence:
         base["evidence"] = "insufficient_evidence"
         return base
@@ -1020,6 +1047,8 @@ def promotion_gate_review(evidence: xr.Dataset) -> dict[str, object]:
         str(base["solar"].get("status", "blocked")),
         str(base["load"].get("status", "blocked")),
     ]
+    if isinstance(base["ensemble"], Mapping):
+        gate_statuses.append(str(base["ensemble"].get("status", "blocked")))
     base["quantitative_gates"] = (
         "pass" if gate_statuses and all(status == "pass" for status in gate_statuses) else "not_all_pass"
     )

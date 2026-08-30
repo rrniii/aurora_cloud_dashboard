@@ -2076,6 +2076,24 @@ def power_solar_evaluation(lane: str = "D_physical_solar_load_residual") -> dict
     except Exception as exc:
         # Do not disclose candidate filesystem layout through an API error.
         raise KeyError("Power candidate comparison data is unavailable") from exc
+    public_ablations = status.get("public_model_ablation_results", {})
+    safe_public_ablations: dict[str, dict[str, str]] = {}
+    if isinstance(public_ablations, dict):
+        for source, value in public_ablations.items():
+            if not isinstance(value, dict):
+                continue
+            safe_public_ablations[str(source)] = {
+                field: str(value[field])
+                for field in (
+                    "status",
+                    "candidate_lane",
+                    "forecast_model_contract_id",
+                    "forecast_identity_id",
+                    "source_manifest_digest",
+                    "member_handling",
+                )
+                if field in value
+            }
     return {
         "environment": "development",
         "authority": "candidate",
@@ -2096,6 +2114,8 @@ def power_solar_evaluation(lane: str = "D_physical_solar_load_residual") -> dict
         "baselineControlContractID": str(candidate_attrs.get("baseline_control_contract_id", "")),
         "degradedModeCode": str(candidate_attrs.get("degraded_mode_code", "")),
         "loadResidualStatus": str(candidate_attrs.get("load_residual_model_status", "")),
+        "memberwiseEnsemble": lane_status.get("memberwise_ensemble", {}),
+        "publicSourceAblations": safe_public_ablations,
         "promotionStatus": str(status.get("promotion_status", "")),
         "evaluation": summary,
         "comparison": points,

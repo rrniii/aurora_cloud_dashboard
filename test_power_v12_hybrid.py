@@ -20,7 +20,16 @@ from generate_power_soc_forecast import (
     generate,
 )
 from generate_power_soc_v12_candidate import run_candidate
+from power_issue_time_features import site_extract_sha256
 from power_load_dynamics import ControlledLoadProfile
+from power_solar_model import load_physical_solar_config
+from power_v12_ensemble import (
+    build_candidate_memberwise_ensemble,
+    build_campaign_ensemble_evidence,
+    ensemble_evaluation_contract_from_forecast,
+    ensemble_promotion_gate,
+    write_immutable_ensemble_pair_bundle,
+)
 from power_v12_hybrid import (
     build_campaign_evidence,
     campaign_score_surfaces,
@@ -232,6 +241,8 @@ class HybridCandidateTests(unittest.TestCase):
             input_path = root / "source" / "forcing.grib2"
             baseline_path = root / "baseline" / "power_soc_forecast.zarr"
             archive_path = root / "baseline" / "power_soc_forecast_archive.zarr"
+            baseline_ensemble_path = root / "baseline" / "power_soc_ensemble_forecast.zarr"
+            public_source_root = root / "public-source-inputs"
             power.to_zarr(power_path, mode="w", consolidated=True)
             input_path.write_bytes(b"v12 synthetic forcing")
             with patch("generate_power_soc_forecast.open_provider_solar_forecast", return_value=provider):
@@ -252,23 +263,89 @@ class HybridCandidateTests(unittest.TestCase):
                     archive_forecast=True,
                     state_override={"solar_calibration_factor_w_per_wm2": 8.0},
                 )
+                with xr.open_zarr(baseline_path, chunks={}) as opened:
+                    baseline_forecast = opened.load()
+                member_count = 3
+                member_grid = np.arange(1, member_count + 1, dtype=np.int16)
+                solar_irradiance = np.asarray(
+                    baseline_forecast["ECMWFSolarIrradiance"].values, dtype=np.float64
+                )
+                solar_watts = np.asarray(
+                    baseline_forecast["ForecastSolarWatts"].values, dtype=np.float64
+                )
+                load_watts = np.asarray(
+                    baseline_forecast["ForecastLoadWatts"].values, dtype=np.float64
+                )
+                soc = np.asarray(
+                    baseline_forecast["BatterySOCForecast"].values, dtype=np.float64
+                )
+                baseline_ensemble = xr.Dataset(
+                    {
+                        "BatterySOCForecastEnsemble": (("member", "time"), np.tile(soc, (member_count, 1))),
+                        "ECMWFSolarIrradianceEnsemble": (("member", "time"), np.tile(solar_irradiance, (member_count, 1))),
+                        "ForecastSolarWattsEnsemble": (("member", "time"), np.tile(solar_watts, (member_count, 1))),
+                        "ForecastLoadWattsEnsemble": (("member", "time"), np.tile(load_watts, (member_count, 1))),
+                        "ForecastLoadPhaseCodeEnsemble": (("member", "time"), np.zeros((member_count, len(soc)), dtype=np.int8)),
+                        "BatteryUsableCapacityKWhEnsemble": (("member",), np.asarray([25.0, 26.0, 27.0])),
+                        "BatteryChargeEfficiencyEnsemble": (("member",), np.asarray([0.90, 0.92, 0.94])),
+                        "BatteryDischargeEfficiencyEnsemble": (("member",), np.asarray([0.90, 0.92, 0.94])),
+                    },
+                    coords={"member": member_grid, "time": baseline_forecast["time"].values},
+                    attrs={
+                        "initial_soc_time": baseline_forecast.attrs["initial_soc_time"],
+                        "initial_soc_pct": baseline_forecast.attrs["initial_soc_pct"],
+                        "ecmwf_cycle_time": baseline_forecast.attrs["ecmwf_cycle_time"],
+                        "forecast_horizon_hours": baseline_forecast.attrs["forecast_horizon_hours"],
+                    },
+                )
+                baseline_ensemble.to_zarr(baseline_ensemble_path, mode="w", consolidated=True)
+                public_source_root.mkdir()
+                public_ghi = np.nan_to_num(solar_irradiance, nan=0.0, posinf=0.0, neginf=0.0)
+                public_extract = public_source_root / "ifs.zarr"
+                xr.Dataset(
+                    {"ghi_w_m2": (("time",), public_ghi)},
+                    coords={"time": baseline_forecast["time"].values},
+                ).to_zarr(public_extract, mode="w", consolidated=True)
+                (public_source_root / "ifs.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "site-extracted-public-source-v2",
+                            "source": "IFS",
+                            "site_extract_only": True,
+                            "global_grid_retained": False,
+                            "source_cycle_time_utc": baseline_forecast.attrs["ecmwf_cycle_time"],
+                            "delivery_time_utc": baseline_forecast.attrs["initial_soc_time"],
+                            "site_extract_path": "ifs.zarr",
+                            "site_extract_format": "zarr",
+                            "irradiance_variable": "ghi_w_m2",
+                            "site_latitude": 64.829694,
+                            "site_longitude": -23.248139,
+                            "site_extract_sha256": site_extract_sha256(public_extract),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 baseline_digest = _tree_digest(baseline_path)
                 archive_digest = _tree_digest(archive_path)
                 results = run_candidate(
                     baseline_forecast_zarr=baseline_path,
                     baseline_archive_zarr=archive_path,
+                    baseline_ensemble_zarr=baseline_ensemble_path,
                     candidate_root=root / "candidate",
                     power_zarr=power_path,
                     pdu_zarr=root / "source" / "missing-pdu.zarr",
                     physical_config=CONFIG_PATH,
+                    public_source_manifest_root=public_source_root,
                 )
                 repeated = run_candidate(
                     baseline_forecast_zarr=baseline_path,
                     baseline_archive_zarr=archive_path,
+                    baseline_ensemble_zarr=baseline_ensemble_path,
                     candidate_root=root / "candidate",
                     power_zarr=power_path,
                     pdu_zarr=root / "source" / "missing-pdu.zarr",
                     physical_config=CONFIG_PATH,
+                    public_source_manifest_root=public_source_root,
                 )
             self.assertEqual(set(results), {"B_physical_solar", "C_load_residual", "D_physical_solar_load_residual"})
             self.assertEqual(results, repeated)
@@ -276,6 +353,8 @@ class HybridCandidateTests(unittest.TestCase):
             self.assertEqual(_tree_digest(archive_path), archive_digest)
             status = json.loads((root / "candidate" / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["status"], "complete")
+            self.assertEqual(status["memberwise_ensemble_input_status"], "available")
+            self.assertEqual(status["public_model_ablation_results"]["ifs"]["status"], "complete")
             acceptance = json.loads((root / "candidate" / "acceptance_record.json").read_text(encoding="utf-8"))
             review = json.loads((root / "candidate" / "review_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(acceptance["status"], "not_accepted")
@@ -307,6 +386,8 @@ class HybridCandidateTests(unittest.TestCase):
             )
             self.assertTrue(manifest_path.exists())
             self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8"))["pair_status"], "complete")
+            ensemble_status = status["lanes"]["D_physical_solar_load_residual"]["memberwise_ensemble"]
+            self.assertEqual(ensemble_status["status"], "complete", ensemble_status)
             source_manifest = next((root / "candidate" / "source_manifests").glob("*.json"))
             manifest = json.loads(source_manifest.read_text(encoding="utf-8"))
             self.assertIn("issue_time_features", manifest)
@@ -454,3 +535,166 @@ class HybridCandidateTests(unittest.TestCase):
         self.assertEqual(review["quantitative_gates"], "pass")
         self.assertEqual(review["ensemble"], "blocked_memberwise_candidate_not_generated")
         self.assertEqual(review["status"], "not_eligible")
+
+    def test_memberwise_candidate_ensemble_preserves_pair_and_replays_legacy_solar(self) -> None:
+        issue = pd.Timestamp("2026-06-21T06:00:00")
+        times = pd.date_range(issue, periods=5, freq="3h")
+        common_attrs = {
+            "initial_soc_time": issue.isoformat(),
+            "initial_soc_pct": "70",
+            "ecmwf_cycle_time": issue.floor("3h").isoformat(),
+            "forecast_model_contract_id": "candidate-contract",
+            "forecast_system_version": "power-v12-hybrid-candidate",
+            "feature_set_version": "issue-safe-v4",
+            "feature_set_digest": "features",
+            "forecast_code_revision": "test",
+            "baseline_control_contract_id": "baseline-contract",
+            "baseline_control_system_version": "v10",
+            "local_feature_contract_id": "local-v1",
+            "source_cycle_set_id": "ecmwf:test",
+            "candidate_lane": "B_physical_solar",
+            "publication_signature": "candidate-publication",
+            "forecast_identity_id": "candidate-identity",
+            "battery_usable_capacity_kwh": "26",
+            "battery_charge_efficiency": "0.92",
+            "battery_discharge_efficiency": "0.92",
+            "battery_max_charge_w": "3000",
+            "battery_max_discharge_w": "3000",
+        }
+        baseline = xr.Dataset(
+            {
+                "BatterySOCForecast": (("time",), np.asarray([70.0, 70.0, 70.0, 70.0, 70.0])),
+                "ForecastLoadWatts": (("time",), np.full(len(times), 180.0)),
+                "ForecastSolarWatts": (("time",), np.asarray([0.0, 100.0, 500.0, 300.0, 0.0])),
+            },
+            coords={"time": times},
+            attrs={**common_attrs, "forecast_model_contract_id": "baseline-contract"},
+        )
+        candidate = baseline.copy(deep=True)
+        candidate.attrs.update(common_attrs)
+        candidate["ForecastSolarWatts"] = (("time",), np.asarray([0.0, 400.0, 1200.0, 700.0, 0.0]))
+        members = np.asarray([1, 2, 3], dtype=np.int16)
+        irradiance = np.asarray(
+            [
+                [0.0, 120.0, 500.0, 300.0, 0.0],
+                [0.0, 100.0, 450.0, 250.0, 0.0],
+                [0.0, 80.0, 400.0, 220.0, 0.0],
+            ]
+        )
+        baseline_ensemble = xr.Dataset(
+            {
+                "BatterySOCForecastEnsemble": (("member", "time"), np.full((3, len(times)), 70.0)),
+                "ECMWFSolarIrradianceEnsemble": (("member", "time"), irradiance),
+                "ForecastSolarWattsEnsemble": (("member", "time"), irradiance * 2.0),
+                "ForecastLoadWattsEnsemble": (("member", "time"), np.asarray([[170.0] * 5, [180.0] * 5, [190.0] * 5])),
+                "ForecastLoadPhaseCodeEnsemble": (("member", "time"), np.zeros((3, len(times)), dtype=np.int8)),
+                "BatteryUsableCapacityKWhEnsemble": (("member",), np.asarray([25.0, 26.0, 27.0])),
+                "BatteryChargeEfficiencyEnsemble": (("member",), np.asarray([0.90, 0.92, 0.94])),
+                "BatteryDischargeEfficiencyEnsemble": (("member",), np.asarray([0.90, 0.92, 0.94])),
+            },
+            coords={"member": members, "time": times},
+            attrs={
+                "initial_soc_time": issue.isoformat(),
+                "initial_soc_pct": "70",
+                "ecmwf_cycle_time": issue.floor("3h").isoformat(),
+                "forecast_horizon_hours": "12",
+            },
+        )
+        config = load_physical_solar_config(CONFIG_PATH)
+        physical = build_candidate_memberwise_ensemble(
+            baseline,
+            candidate,
+            baseline_ensemble,
+            lane="B_physical_solar",
+            physical_config=config,
+            latitude=64.829694,
+            longitude=-23.248139,
+        )
+        self.assertEqual(physical.attrs["solar_forcing_mode"], "memberwise_physical_available_pv")
+        self.assertEqual(physical.attrs["candidate_lane"], "B_physical_solar")
+        self.assertFalse(
+            np.allclose(
+                physical["ForecastSolarWattsEnsemble"].values,
+                baseline_ensemble["ForecastSolarWattsEnsemble"].values,
+                equal_nan=True,
+            )
+        )
+        candidate.attrs["candidate_lane"] = "C_load_residual"
+        legacy = build_candidate_memberwise_ensemble(
+            baseline,
+            candidate,
+            baseline_ensemble,
+            lane="C_load_residual",
+            physical_config=config,
+            latitude=64.829694,
+            longitude=-23.248139,
+        )
+        np.testing.assert_allclose(
+            legacy["ForecastSolarWattsEnsemble"].values,
+            baseline_ensemble["ForecastSolarWattsEnsemble"].values,
+            rtol=0.0,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            legacy["ForecastLoadWattsEnsemble"].values,
+            baseline_ensemble["ForecastLoadWattsEnsemble"].values,
+            rtol=0.0,
+            atol=0.0,
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = write_immutable_ensemble_pair_bundle(
+                root,
+                deterministic_pair_id="pair-1",
+                baseline_ensemble=baseline_ensemble,
+                candidate_ensemble=physical,
+                manifest_extra={"baseline_publication_signature": "baseline-publication"},
+            )
+            self.assertTrue((bundle / "pair_manifest.json").exists())
+            power = xr.Dataset(
+                {"BatterySOC": (("time",), physical["BatterySOCForecastP50"].values)},
+                coords={"time": times},
+            )
+            evidence = build_campaign_ensemble_evidence(
+                root / "ensemble_pairs",
+                power,
+                lane="B_physical_solar",
+                evaluation_contract=ensemble_evaluation_contract_from_forecast(physical),
+            )
+        self.assertEqual(evidence.sizes["record"], len(times))
+
+    def test_memberwise_ensemble_gate_requires_calibrated_spread_and_scores_brier(self) -> None:
+        issues = pd.date_range("2026-06-01T00:00:00", periods=30, freq="8h")
+        leads = np.asarray([3.0, 12.0, 30.0, 60.0])
+        issue_values = np.repeat(issues.to_numpy(dtype="datetime64[ns]"), len(leads))
+        lead_values = np.tile(leads, len(issues))
+        valid_values = np.asarray(
+            [issue + pd.Timedelta(hours=float(lead)) for issue in issues for lead in leads],
+            dtype="datetime64[ns]",
+        )
+        count = len(issue_values)
+        observed = np.where(np.arange(count) % 4 == 0, 35.0, 60.0)
+        candidate_members = np.column_stack((observed - 1.0, observed, observed + 1.0))
+        # Deliberately leave one fifth of observations outside P10-P90: this
+        # produces the required calibrated 80% nominal interval coverage.
+        outside = np.arange(count) % 5 == 0
+        candidate_members[outside] += 4.0
+        baseline_members = np.column_stack((observed + 10.0, observed + 11.0, observed + 12.0))
+        evidence = xr.Dataset(
+            {
+                "IssueTime": (("record",), issue_values),
+                "ValidTime": (("record",), valid_values),
+                "LeadHours": (("record",), lead_values),
+                "SOCAuthoringAnchor": (("record",), np.full(count, 80.0)),
+                "ObservedSOC": (("record",), observed),
+                "EvaluationAvailable": (("record",), np.ones(count, dtype=bool)),
+                "CandidateSOCMembers": (("record", "member"), candidate_members),
+                "BaselineSOCMembers": (("record", "member"), baseline_members),
+            },
+            coords={"record": np.arange(count), "member": np.asarray([1, 2, 3])},
+        )
+        gate = ensemble_promotion_gate(evidence)
+        self.assertEqual(gate["status"], "pass")
+        self.assertEqual(gate["crps_status"], "pass")
+        self.assertEqual(gate["coverage_status"], "pass")
+        self.assertEqual(gate["reserve_events"], "pass")

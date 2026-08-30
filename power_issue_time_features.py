@@ -24,7 +24,8 @@ from uas_mqtt import parse_uas_mqtt_line
 
 
 ISSUE_TIME_FEATURE_SCHEMA_VERSION = "issue-time-local-features-v1"
-PUBLIC_SOURCE_ABLATION_SCHEMA_VERSION = "site-extracted-public-source-v1"
+PUBLIC_SOURCE_ABLATION_SCHEMA_VERSION = "site-extracted-public-source-v2"
+MAX_PUBLIC_SITE_EXTRACT_BYTES = 64 * 1024 * 1024
 
 APS_FIELDS = (
     "BatterySOC",
@@ -215,6 +216,127 @@ def _tail_lines(path: Path, *, maximum_bytes: int = 131_072) -> list[str]:
     return lines
 
 
+def site_extract_sha256(path: Path) -> str:
+    """Hash a small immutable site extract without retaining any global grid.
+
+    The source producer normalises public forecasts into a compact local Zarr
+    or NetCDF extract.  A deterministic tree hash lets the power candidate
+    reject changed forcing before it is admitted to an issue-time ablation.
+    """
+
+    path = Path(path)
+    digest = hashlib.sha256()
+    if path.is_file():
+        if path.stat().st_size > MAX_PUBLIC_SITE_EXTRACT_BYTES:
+            raise ValueError("site extract exceeds the bounded 64 MiB limit")
+        digest.update(path.name.encode("utf-8"))
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError("site extract is neither a regular file nor directory")
+    total = 0
+    for item in sorted(path.rglob("*")):
+        if item.is_symlink():
+            raise ValueError("site extract cannot contain symbolic links")
+        if not item.is_file():
+            continue
+        relative = item.relative_to(path).as_posix()
+        size = item.stat().st_size
+        total += size
+        if total > MAX_PUBLIC_SITE_EXTRACT_BYTES:
+            raise ValueError("site extract exceeds the bounded 64 MiB limit")
+        digest.update(relative.encode("utf-8"))
+        with item.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    if total == 0:
+        raise ValueError("site extract is empty")
+    return digest.hexdigest()
+
+
+def public_source_manifest_record(
+    source: str,
+    *,
+    root: Path | None,
+    cutoff: pd.Timestamp,
+) -> dict[str, object]:
+    """Validate one issue-time-safe, site-only public-source manifest."""
+
+    record: dict[str, object] = {
+        "source": source,
+        "role": "separate_ablation_only_not_pooled",
+        "required_schema": PUBLIC_SOURCE_ABLATION_SCHEMA_VERSION,
+    }
+    if root is None:
+        record["status"] = "not_enrolled_no_site_manifest_root"
+        return record
+    root = Path(root)
+    path = root / f"{source.lower()}.json"
+    if not path.is_file():
+        record["status"] = "not_enrolled_no_site_manifest"
+        return record
+    try:
+        if path.stat().st_size > 1_000_000:
+            raise ValueError("manifest exceeds 1 MiB")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("manifest is not an object")
+        delivery = _utc_naive(raw["delivery_time_utc"])
+        cycle = _utc_naive(raw["source_cycle_time_utc"])
+        checksum = str(raw["site_extract_sha256"]).lower()
+        relative = Path(str(raw["site_extract_path"]))
+        extract_format = str(raw["site_extract_format"]).lower()
+        irradiance_variable = str(raw["irradiance_variable"])
+        if raw.get("schema_version") != PUBLIC_SOURCE_ABLATION_SCHEMA_VERSION:
+            raise ValueError("schema mismatch")
+        if str(raw.get("source", "")).upper() != source:
+            raise ValueError("source mismatch")
+        if raw.get("site_extract_only") is not True:
+            raise ValueError("not site extracted")
+        if raw.get("global_grid_retained") is not False:
+            raise ValueError("global-grid retention not explicitly rejected")
+        if relative.is_absolute() or ".." in relative.parts or str(relative) in {"", "."}:
+            raise ValueError("invalid site extract path")
+        extract = (root / relative).resolve()
+        if os.path.commonpath((str(root.resolve()), str(extract))) != str(root.resolve()):
+            raise ValueError("site extract escapes manifest root")
+        if extract_format not in {"zarr", "netcdf"}:
+            raise ValueError("unsupported compact site extract format")
+        if not irradiance_variable:
+            raise ValueError("missing irradiance variable")
+        if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+            raise ValueError("invalid checksum")
+        if site_extract_sha256(extract) != checksum:
+            raise ValueError("site extract checksum mismatch")
+        latitude = float(raw["site_latitude"])
+        longitude = float(raw["site_longitude"])
+        if not (np.isfinite(latitude) and np.isfinite(longitude)):
+            raise ValueError("invalid site coordinates")
+    except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        record["status"] = "invalid_site_manifest"
+        return record
+    record.update(
+        {
+            "source_cycle_time_utc": _iso(cycle),
+            "delivery_time_utc": _iso(delivery),
+            "site_extract_sha256": f"sha256:{checksum}",
+            "site_extract_path": relative.as_posix(),
+            "site_extract_format": extract_format,
+            "irradiance_variable": irradiance_variable,
+            "site_latitude": latitude,
+            "site_longitude": longitude,
+        }
+    )
+    record["status"] = (
+        "issue_time_available_pending_independent_ablation"
+        if delivery <= cutoff and cycle <= cutoff
+        else "late_delivery_excluded_from_issue_time_use"
+    )
+    return record
+
+
 def _menapia_component(path: Path | None, *, cutoff: pd.Timestamp) -> dict[str, object]:
     component: dict[str, object] = {
         "role": "fresh raw dock-tier context; delayed flight products are retrospective only",
@@ -276,51 +398,7 @@ def _public_source_record(
     has recorded a checksum, cycle and real delivery time in this compact
     manifest.  Even then it is *not* pooled into the ECMWF forecast.
     """
-    record: dict[str, object] = {
-        "source": source,
-        "role": "separate_ablation_only_not_pooled",
-        "required_schema": PUBLIC_SOURCE_ABLATION_SCHEMA_VERSION,
-    }
-    if root is None:
-        record["status"] = "not_enrolled_no_site_manifest_root"
-        return record
-    path = Path(root) / f"{source.lower()}.json"
-    if not path.is_file():
-        record["status"] = "not_enrolled_no_site_manifest"
-        return record
-    try:
-        if path.stat().st_size > 1_000_000:
-            raise ValueError("manifest exceeds 1 MiB")
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("manifest is not an object")
-        delivery = _utc_naive(raw["delivery_time_utc"])
-        cycle = _utc_naive(raw["source_cycle_time_utc"])
-        checksum = str(raw["site_extract_sha256"]).lower()
-        if raw.get("schema_version") != PUBLIC_SOURCE_ABLATION_SCHEMA_VERSION:
-            raise ValueError("schema mismatch")
-        if str(raw.get("source", "")).upper() != source:
-            raise ValueError("source mismatch")
-        if raw.get("site_extract_only") is not True:
-            raise ValueError("not site extracted")
-        if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
-            raise ValueError("invalid checksum")
-    except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
-        record["status"] = "invalid_site_manifest"
-        return record
-    record.update(
-        {
-            "source_cycle_time_utc": _iso(cycle),
-            "delivery_time_utc": _iso(delivery),
-            "site_extract_sha256": f"sha256:{checksum}",
-        }
-    )
-    record["status"] = (
-        "issue_time_available_pending_independent_ablation"
-        if delivery <= cutoff
-        else "late_delivery_excluded_from_issue_time_use"
-    )
-    return record
+    return public_source_manifest_record(source, root=root, cutoff=cutoff)
 
 
 @dataclass(frozen=True)

@@ -118,6 +118,13 @@ class MobileCatalogTests(unittest.TestCase):
                         "status": "complete",
                         "promotion_status": "not_eligible_requires_campaign_evidence",
                         "lanes": {lane: {"publication_signature": signature}},
+                        "public_model_ablation_results": {
+                            "ifs": {
+                                "status": "complete",
+                                "candidate_lane": "E_public_source_ifs",
+                                "path": "/data/aurora/dev-products/secret.zarr",
+                            }
+                        },
                     }
                 )
             )
@@ -135,6 +142,7 @@ class MobileCatalogTests(unittest.TestCase):
             self.assertEqual(payload["comparison"][1]["candidateSOC"], 69.5)
             self.assertEqual(payload["localFeatureContractID"], "issue-features-v1-test")
             self.assertIn("gfs=not_enrolled", payload["sourceAvailabilityCode"])
+            self.assertEqual(payload["publicSourceAblations"]["ifs"]["status"], "complete")
             self.assertNotIn("path", json.dumps(payload).lower())
 
     def test_float_health_states_are_normalized_and_counted(self) -> None:

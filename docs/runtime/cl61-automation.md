@@ -78,6 +78,12 @@ cycles across 10 UTC days and all of the following:
   result is insufficient.
 - Solar MAE and absolute load bias each improve by at least 10%; P10–P90
   coverage is 75–90%; quantile ordering and SOC limits hold.
+- The same baseline ECMWF site members must be propagated through the
+  candidate-only physical model. Candidate ensemble CRPS must beat both the
+  baseline ensemble and SOC persistence, while P10–P90 coverage remains
+  75–90%. Reserve-event Brier skill must pass when at least ten events exist;
+  otherwise the review records `insufficient_events` rather than claiming a
+  pass.
 - Each longer lead has non-negative persistence skill or at least 25% lower
   MAE than baseline without worse absolute bias.
 

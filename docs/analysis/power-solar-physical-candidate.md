@@ -101,8 +101,11 @@ anchor, hashes the GRIB, and writes only beneath:
 The main generator refuses to run the physical model against any configured
 baseline latest/state/archive/skill/hindcast path. Candidate and v10 issues can
 therefore share a valid time and cycle without overwriting or mixing archive
-rows. The current ensemble remains scalar-v10 and is not combined with this
-candidate.
+rows. The operational ensemble remains read-only. The integrated v12 B/C/D
+candidate propagates the same site members through its physical PV calculation
+in an isolated candidate tree, then scores CRPS, P10--P90 coverage and
+reserve-event Brier skill only from immutable member-wise pairs. It does not
+alter the operational ensemble or use the member output in operating scenarios.
 
 Each completed issue preserves an immutable baseline snapshot, candidate
 snapshot and manifest under
