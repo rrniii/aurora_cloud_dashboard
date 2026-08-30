@@ -50,6 +50,7 @@ nav:
       - Storage layout: runtime/storage-layout.md
       - Archive health: runtime/archive-health.md
       - Services and timers: runtime/services-and-timers.md
+      - CL61 automation boundary: runtime/cl61-automation.md
       - Mobile API: runtime/mobile-api.md
       - Performance logging: runtime/performance-logging.md
       - Display artifact manifest: runtime/display-artifacts.md

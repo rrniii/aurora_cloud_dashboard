@@ -168,6 +168,35 @@ def test_unsafe_cl61_fallback_is_labelled_as_infeasible() -> None:
     assert power_trace_label(ds, load_trace) == "Unsafe fallback load (CL61 off)"
 
 
+def test_unsafe_existing_cl61_is_labelled_as_held_not_switched_off() -> None:
+    panel = next(panel for panel in SUMMARY_LAYOUTS["power"] if panel.key == "operating_plan_schedule")
+    ds = xr.Dataset(
+        attrs={
+            "operating_optimized_safe": "false",
+            "operating_optimized_status": "no_safe_schedule",
+            "operating_optimized_schedule_policy": "cl61_primary_v1",
+            "operating_cl61_primary_continuation_required": "true",
+            "operating_optimized_held_existing_instruments": '["Radar"]',
+        }
+    )
+
+    presentation = cl61_schedule_presentation(ds)
+    cl61_trace = next(trace for trace in panel.traces if trace.var == "OperatingCL61OptimizedCL61On")
+    radar_trace = next(trace for trace in panel.traces if trace.var == "OperatingCL61OptimizedRadarOn")
+    load_trace = next(
+        trace
+        for candidate in SUMMARY_LAYOUTS["power"]
+        if candidate.key == "ecmwf_solar_forecast"
+        for trace in candidate.traces
+        if trace.var == "OperatingCL61OptimizedLoadP50Watts"
+    )
+
+    assert presentation.trace_label == "Unsafe held CL61 continuation"
+    assert power_trace_label(ds, cl61_trace) == "Unsafe held CL61 continuation"
+    assert power_trace_label(ds, radar_trace) == "Observed Radar held (not scheduled)"
+    assert power_trace_label(ds, load_trace) == "Unsafe held-CL61 continuation load"
+
+
 def test_priority_schedule_uses_additive_sum_and_three_instrument_labels() -> None:
     panel = next(panel for panel in SUMMARY_LAYOUTS["power"] if panel.key == "operating_plan_schedule")
     ds = xr.Dataset(

@@ -67,6 +67,35 @@ class MobileAPITests(unittest.TestCase):
             "public, max-age=30, stale-while-revalidate=60",
         )
 
+    def test_cl61_automation_endpoint_is_read_only_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "cl61_automation_status.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "observe_only",
+                        "capability": False,
+                        "control_authority": "observe_only",
+                        "target": {"instrument": "CL61", "pdu_outlet": 5},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "AURORA_MOBILE_API_AUTH_MODE": "public_read_only",
+                    "CL61_AUTOMATION_STATUS_PATH": str(status_path),
+                },
+                clear=False,
+            ):
+                response = self.client.get("/power/cl61-automation")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["available"])
+        self.assertEqual(response.json()["status"]["mode"], "observe_only")
+        self.assertFalse(response.json()["status"]["capability"])
+
     def test_public_read_only_mode_keeps_artifact_inventory_protected(self) -> None:
         with patch.dict(
             os.environ,

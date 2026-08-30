@@ -255,6 +255,73 @@ def power_candidate_evaluation_enabled() -> bool:
     return os.environ.get("AURORA_POWER_CANDIDATE_API_ENABLED", "false").strip().lower() == "true"
 
 
+def cl61_automation_status_path() -> Path:
+    """Return the read-only CL61 shadow-controller status product."""
+    return env_path(
+        "CL61_AUTOMATION_STATUS_PATH",
+        "/data/aurora/dev-products/power/cl61_automation_status.json",
+    )
+
+
+def cl61_automation_status() -> dict[str, Any]:
+    """Expose automation readiness only; this API cannot alter a PDU outlet."""
+    path = cl61_automation_status_path()
+    # Do not disclose an internal product path through a public/mobile API.
+    source = file_record(path)
+    unavailable = {
+        "schema_version": 1,
+        "control_authority": "observe_only",
+        "capability": False,
+        "mode": "unavailable",
+        "target": {"instrument": "CL61", "pdu_outlet": 5},
+        "reason_codes": ["status_product_unavailable"],
+    }
+    if not path.is_file():
+        return {"serverTime": utc_now_iso(), "available": False, "source": source, "status": unavailable}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "serverTime": utc_now_iso(),
+            "available": False,
+            "source": source,
+            "status": {**unavailable, "reason_codes": ["status_product_invalid"]},
+        }
+    if not isinstance(value, dict):
+        return {
+            "serverTime": utc_now_iso(),
+            "available": False,
+            "source": source,
+            "status": {**unavailable, "reason_codes": ["status_product_invalid"]},
+        }
+    # This endpoint is deliberately a read-only development surface.  Do not
+    # normalise an operational-looking payload into something a client could
+    # mistake for permission to control equipment: reject it instead.
+    target = value.get("target")
+    try:
+        target_outlet = int(target.get("pdu_outlet")) if isinstance(target, dict) else None
+    except (TypeError, ValueError):
+        target_outlet = None
+    valid_target = (
+        isinstance(target, dict)
+        and str(target.get("instrument", "")).strip().upper() == "CL61"
+        and target_outlet == 5
+    )
+    if (
+        str(value.get("control_authority", "")).strip().lower() != "observe_only"
+        or bool(value.get("capability", False))
+        or not valid_target
+    ):
+        return {
+            "serverTime": utc_now_iso(),
+            "available": False,
+            "source": source,
+            "status": {**unavailable, "reason_codes": ["non_observe_only_status_rejected"]},
+        }
+    value.setdefault("mode", "unavailable")
+    return {"serverTime": utc_now_iso(), "available": True, "source": source, "status": value}
+
+
 def _representative_power_indices(values, maximum: int = MOBILE_POWER_MAX_POINTS):
     """Keep endpoints and local extrema without overloading native Charts."""
     import numpy as np

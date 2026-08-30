@@ -221,19 +221,18 @@ planning product's solar cycle, not an older planning-cycle load trace. Thus,
 when CL61 is the only powered instrument, the current trace and the fixed CL61
 trace start from the same detected heater/blower phase.
 
-The advisory scheduler considers CL61, Radar, and HATPRO on/off states over the
-first 96 hours. It first maximizes safe CL61 hours, freezes that result, then
-maximizes Radar and finally HATPRO. This makes the priority explicit rather than
-trading a CL61 hour for a lower-priority instrument. The DC baseline and current
-UAS state remain fixed. Each controlled instrument has a minimum 12-hour run
-and at most one planned start per UTC day. All three are off through the rest of
-the 240-hour planning forecast, and every candidate must keep P10 SOC at or
-above 40% across that full horizon. Learned startup, fan, and heater/blower
-phases are checked again before publication. If the fixed DC/UAS reserve case
-still crosses 40%, no feasible schedule exists; zero traces are retained only
-as an unsafe diagnostic fallback. The scheduler is advisory only and never
-issues PDU commands. The existing custom CL61 start/duration editor remains an
-independent what-if calculation.
+The advisory scheduler reserves a feasible CL61 timetable first, then adds
+Radar and HATPRO only from residual reserve. This makes the priority explicit
+rather than trading a CL61 hour for a lower-priority instrument. The DC baseline
+and current UAS state remain fixed; an already-on CL61, Radar, or HATPRO is also
+held at its observed PDU state so the plan cannot assume that another outlet
+has changed. Each newly proposed interval has a minimum 12-hour run and at most
+one planned start per UTC day. Every candidate must keep P10 SOC at or above
+40% across the full 240-hour horizon. Learned startup, fan, and heater/blower
+phases are checked again before publication. The scheduler is advisory only and
+never issues PDU commands; the optional development automation product is a
+non-executable shadow receipt. The existing custom CL61 start/duration editor
+remains an independent what-if calculation.
 
 Archived deterministic forecasts carry `LoadModelVersion`. Load MAE, bias, and
 skill only use rows from a matching model version, preventing retired model

@@ -33,6 +33,7 @@ from power_operating_scenarios import (
     mode_kits,
     load_operating_events,
     optimize_cl61_schedule,
+    optimize_cl61_primary_schedule,
     optimize_priority_schedule,
     _tier_profile_members,
 )
@@ -577,7 +578,9 @@ class OperatingScenarioTests(unittest.TestCase):
         )
 
         optimized = scenarios.sel(scenario=SCENARIO_OPTIMIZED)
-        self.assertEqual(float(optimized["ScenarioCollectionHours"]), 0.0)
+        # A currently-on CL61 is preserved in the diagnostic trace instead of
+        # being silently shed at the first scheduler boundary.
+        self.assertEqual(float(optimized["ScenarioCollectionHours"]), 96.0)
         self.assertEqual(float(optimized["ScenarioSafe"]), 0.0)
         self.assertEqual(scenarios.attrs["optimized_status"], "no_safe_schedule")
         self.assertEqual(
@@ -588,7 +591,7 @@ class OperatingScenarioTests(unittest.TestCase):
             json.loads(scenarios.attrs["optimized_priority_order"]),
             ["CL61", "Radar", "HATPRO"],
         )
-        self.assertIn("all three controlled instruments off", scenarios.attrs["optimized_reason"])
+        self.assertIn("not an instruction to switch CL61 off", scenarios.attrs["optimized_reason"])
         self.assertEqual(scenarios.attrs["optimized_operator_action_required"], "true")
 
     def test_phase_aware_joint_search_retains_safe_single_instrument_subsets(self) -> None:
@@ -1169,6 +1172,79 @@ class OperatingScenarioTests(unittest.TestCase):
         self.assertEqual(result.instrument_hours, {"CL61": 12.0, "Radar": 0.0, "HATPRO": 0.0})
         self.assertAlmostEqual(result.controlled_energy_kwh, 5.88)
 
+    def test_cl61_primary_policy_reserves_cl61_before_other_instruments(self) -> None:
+        times = pd.date_range("2026-07-15T00:00:00", periods=241, freq="1h")
+        solar = np.zeros((20, len(times)))
+        components = np.tile(
+            np.array([40.0, 40.0, 250.0, 200.0, 0.0, 0.0]),
+            (20, 1),
+        )
+
+        combined, primary = optimize_cl61_primary_schedule(
+            times=times,
+            solar_members_w=solar,
+            component_members=components,
+            initial_soc=100.0,
+            capacity_kwh=26.0,
+            base_mode=MODE_DC_ONLY,
+            horizon_hours=96,
+        )
+
+        self.assertTrue(primary.safe)
+        self.assertTrue(combined.safe)
+        self.assertEqual(primary.instrument_hours, {"CL61": 96.0})
+        self.assertEqual(combined.instrument_hours["CL61"], 96.0)
+        self.assertEqual(combined.instrument_hours["Radar"], 0.0)
+        self.assertEqual(combined.instrument_hours["HATPRO"], 0.0)
+        self.assertTrue(
+            all("CL61" in mode_kits(value) for value in combined.modes[1:97])
+        )
+
+    def test_cl61_primary_policy_does_not_shed_an_existing_cl61(self) -> None:
+        times = pd.date_range("2026-07-15T00:00:00", periods=241, freq="1h")
+        solar = np.zeros((20, len(times)))
+        components = np.tile(
+            np.array([40.0, 20.0, 400.0, 300.0, 0.0, 0.0]),
+            (20, 1),
+        )
+
+        combined, primary = optimize_cl61_primary_schedule(
+            times=times,
+            solar_members_w=solar,
+            component_members=components,
+            initial_soc=100.0,
+            capacity_kwh=26.0,
+            base_mode=mode_id(("CL61",)),
+            horizon_hours=96,
+        )
+
+        self.assertTrue(primary.safe)
+        self.assertTrue(combined.safe)
+        self.assertEqual(combined.starts, 0)
+        self.assertTrue(all("CL61" in mode_kits(value) for value in combined.modes))
+
+    def test_cl61_primary_policy_holds_other_current_pdu_loads(self) -> None:
+        times = pd.date_range("2026-07-15T00:00:00", periods=241, freq="1h")
+        solar = np.zeros((20, len(times)))
+        components = np.tile(
+            np.array([40.0, 20.0, 400.0, 300.0, 0.0, 0.0]),
+            (20, 1),
+        )
+
+        combined, primary = optimize_cl61_primary_schedule(
+            times=times,
+            solar_members_w=solar,
+            component_members=components,
+            initial_soc=100.0,
+            capacity_kwh=26.0,
+            base_mode=mode_id(("CL61", "Radar")),
+            horizon_hours=96,
+        )
+
+        self.assertTrue(all("Radar" in mode_kits(value) for value in primary.modes))
+        self.assertTrue(all("Radar" in mode_kits(value) for value in combined.modes))
+        self.assertTrue(all("CL61" in mode_kits(value) for value in combined.modes))
+
     def test_optimizer_protects_reserve_through_full_planning_horizon(self) -> None:
         times = pd.date_range("2026-07-15T00:00:00", periods=241, freq="1h")
         solar = np.zeros((20, len(times)))
@@ -1254,7 +1330,9 @@ class OperatingScenarioTests(unittest.TestCase):
         self.assertGreater(float(np.nanmax(tail_solar)), 0.0)
         self.assertGreater(float(np.nanmax(tail_solar) - np.nanmin(tail_solar)), 0.0)
         optimized_codes = scenarios.sel(scenario=SCENARIO_OPTIMIZED)["ScenarioModeCode"].values
-        self.assertTrue(np.all((optimized_codes[97:] & 1) == 0))
+        # The current observed CL61 state remains held through the full
+        # planning horizon under the CL61-first continuation policy.
+        self.assertTrue(np.all((optimized_codes[97:] & 1) == 1))
 
     def test_generator_persists_versioned_state_scenarios_and_recommendation(self) -> None:
         power, pdu = _training_data()
@@ -1271,6 +1349,9 @@ class OperatingScenarioTests(unittest.TestCase):
                 "scenarios": root / "operating_scenarios.zarr",
                 "model": root / "model.json",
                 "recommendations": root / "recommendations.json",
+                "automation_intent": root / "cl61_automation_intent.json",
+                "automation_status": root / "cl61_automation_status.json",
+                "automation_history": root / "cl61_automation_history.jsonl",
             }
             power.to_zarr(paths["power"], mode="w", consolidated=True)
             pdu.to_zarr(paths["pdu"], mode="w", consolidated=True)
@@ -1290,6 +1371,10 @@ class OperatingScenarioTests(unittest.TestCase):
                 planning_hours=96,
                 optimization_hours=96,
                 lookback_days=2,
+                automation_intent_output=paths["automation_intent"],
+                automation_status_output=paths["automation_status"],
+                automation_history_output=paths["automation_history"],
+                automation_shadow_enabled=True,
             )
 
             state = xr.open_zarr(paths["state"], chunks={})
@@ -1312,6 +1397,12 @@ class OperatingScenarioTests(unittest.TestCase):
                 scenarios.close()
             self.assertTrue(paths["model"].exists())
             self.assertTrue(paths["recommendations"].exists())
+            automation_status = json.loads(paths["automation_status"].read_text(encoding="utf-8"))
+            self.assertEqual(automation_status["mode"], "observe_only")
+            self.assertFalse(automation_status["capability"])
+            self.assertEqual(automation_status["target"]["pdu_outlet"], 5)
+            self.assertTrue(paths["automation_intent"].exists())
+            self.assertTrue(paths["automation_history"].exists())
             archive = json.loads(paths["recommendations"].read_text(encoding="utf-8"))
             self.assertEqual(archive["schema_version"], 4)
             record = archive["recommendations"][-1]

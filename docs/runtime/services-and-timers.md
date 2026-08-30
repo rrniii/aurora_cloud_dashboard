@@ -189,6 +189,10 @@ The app merges that compact product into the display summary at read time; it
 does not rebuild the full Power summary every five minutes. Both environments
 run these advisory products: production writes under `/data/aurora/products`,
 while development writes independently under `/data/aurora/dev-products`.
+On development only, the same run may publish a compact CL61
+`observe_only` shadow status and append-only history. It has no PDU client and
+does not create an actuator service; the separately managed ASS-local
+controller remains disabled.
 
 The deterministic and scenario jobs use semantic publication signatures.
 When a timer run has the same physical SOC/load anchor, mode, ECMWF cycle,

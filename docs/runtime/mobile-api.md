@@ -95,6 +95,10 @@ token-protected, unknown mode values fail closed, and the legacy
   do not have to infer display units. The
   legacy `all`, `observed`, `forecast_24h`, `forecast_96h`, and `verification`
   groups remain supported.
+- `GET /power/cl61-automation` - development shadow-controller status only.
+  It returns a bounded diagnostic product with `control_authority=observe_only`
+  and `capability=false`; the endpoint accepts no command and has no PDU
+  transport.
 - `GET /media/power/figure/current|forecast` - an ETag-backed prewarmed Plotly
   JSON figure for a Power section. Access follows the host authentication mode.
   The response never exposes raw or Zarr paths and can be cached by native

@@ -14,6 +14,51 @@ import mobile_catalog
 
 
 class MobileCatalogTests(unittest.TestCase):
+    def test_cl61_automation_status_is_read_only_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cl61_automation_status.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "mode": "observe_only",
+                        "capability": False,
+                        "control_authority": "observe_only",
+                        "target": {"instrument": "CL61", "pdu_outlet": 5},
+                        "last_proposed_action": "start",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"CL61_AUTOMATION_STATUS_PATH": str(path)}):
+                payload = mobile_catalog.cl61_automation_status()
+
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["status"]["mode"], "observe_only")
+        self.assertFalse(payload["status"]["capability"])
+        self.assertEqual(payload["status"]["target"]["pdu_outlet"], 5)
+        self.assertNotIn("path", payload["source"])
+
+    def test_cl61_automation_status_rejects_control_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cl61_automation_status.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "mode": "armed",
+                        "capability": True,
+                        "control_authority": "operational",
+                        "target": {"instrument": "CL61", "pdu_outlet": 5},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"CL61_AUTOMATION_STATUS_PATH": str(path)}):
+                payload = mobile_catalog.cl61_automation_status()
+
+        self.assertFalse(payload["available"])
+        self.assertFalse(payload["status"]["capability"])
+        self.assertEqual(payload["status"]["reason_codes"], ["non_observe_only_status_rejected"])
+
     def test_power_candidate_evaluation_is_explicitly_development_only(self) -> None:
         import numpy as np
         import pandas as pd

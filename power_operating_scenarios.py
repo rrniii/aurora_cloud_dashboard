@@ -74,6 +74,9 @@ KIT_ORDER = ("CL61", "Radar", "HATPRO", "UAS")
 KIT_BITS = {name: 1 << index for index, name in enumerate(KIT_ORDER)}
 KIT_OUTLETS = {"UAS": 4, "CL61": 5, "Radar": 6, "HATPRO": 8}
 OPERATING_PRIORITY = ("CL61", "Radar", "HATPRO")
+SCHEDULE_POLICY_CL61_PRIMARY = "cl61_primary_v1"
+SCHEDULE_POLICY_ENERGY_MAXIMISING = "energy_maximising_v1"
+DEFAULT_SCHEDULE_POLICY = SCHEDULE_POLICY_CL61_PRIMARY
 COMPONENTS = ("DC",) + KIT_ORDER + ("UnknownAC",)
 COMPONENT_INDEX = {name: index for index, name in enumerate(COMPONENTS)}
 
@@ -283,6 +286,9 @@ def describe_priority_schedule(
     priorities: Sequence[str] = OPERATING_PRIORITY,
     minimum_soc: float = MINIMUM_OPERATIONAL_SOC_PCT,
     controlled_energy_kwh: float | None = None,
+    policy: str = SCHEDULE_POLICY_ENERGY_MAXIMISING,
+    continuation_required: bool = False,
+    held_instruments: Sequence[str] = (),
 ) -> CL61ScheduleDiagnostic:
     """Explain the additive advisory plan without implying automatic PDU control."""
     controlled = tuple(str(value) for value in priorities)
@@ -298,6 +304,22 @@ def describe_priority_schedule(
     )
     priority_text = " > ".join(controlled)
     if not safe:
+        if policy == SCHEDULE_POLICY_CL61_PRIMARY and continuation_required:
+            reason = (
+                f"The existing CL61 is deliberately retained in this diagnostic, but its "
+                f"CL61-first continuation cannot keep P10 SOC at or above {float(minimum_soc):g}% "
+                "through the planning horizon. This is not an instruction to switch CL61 off; "
+                "automatic control remains unavailable and operator review is required."
+            )
+            return CL61ScheduleDiagnostic(
+                status="no_safe_schedule",
+                reason_code="existing_cl61_continuation_below_reserve",
+                reason=reason,
+                base_mode=base_mode,
+                base_mode_label=base_label,
+                blocking_instruments=fixed_kits,
+                operator_action_required=True,
+            )
         fixed_detail = (
             f"The non-controlled {_human_list(fixed_kits)} load remains on. "
             if fixed_kits
@@ -320,8 +342,14 @@ def describe_priority_schedule(
             operator_action_required=True,
         )
 
+    held = {str(name) for name in held_instruments}
     selected = tuple(
-        f"{name} {float(instrument_hours.get(name, 0.0)):.0f} h"
+        (
+            f"{name} {float(instrument_hours.get(name, 0.0)):.0f} h "
+            "(held observed state)"
+        )
+        if name in held
+        else f"{name} {float(instrument_hours.get(name, 0.0)):.0f} h"
         for name in controlled
         if float(instrument_hours.get(name, 0.0)) > 0.0
     )
@@ -343,20 +371,31 @@ def describe_priority_schedule(
 
     total_hours = float(sum(max(float(instrument_hours.get(name, 0.0)), 0.0) for name in controlled))
     energy_text = (
-        f" and {float(controlled_energy_kwh):.2f} kWh of additive controlled energy"
+        f" and {float(controlled_energy_kwh):.2f} kWh of additive instrument energy"
         if controlled_energy_kwh is not None and np.isfinite(float(controlled_energy_kwh))
         else ""
     )
+    if policy == SCHEDULE_POLICY_CL61_PRIMARY:
+        objective = (
+            "The CL61-first advisory scheduler reserves the feasible CL61 timetable first, "
+            "then adds Radar and HATPRO only from residual reserve. Existing non-CL61 "
+            "instruments are held at their observed state rather than implicitly switched."
+        )
+        reason_code = "safe_cl61_primary_schedule"
+    else:
+        objective = (
+            "The additive advisory scheduler maximises controlled energy first, then total "
+            f"instrument-hours; {priority_text} breaks otherwise-equal plans."
+        )
+        reason_code = "safe_priority_schedule"
     reason = (
-        "The additive advisory scheduler maximises controlled energy first, then total "
-        f"instrument-hours; {priority_text} breaks otherwise-equal plans. This plan provides "
-        f"{_human_list(selected)}, totalling {total_hours:.0f} instrument-hours{energy_text}, while "
-        f"keeping full-horizon P10 SOC at or above {float(minimum_soc):g}%. It never operates "
-        "PDU outlets automatically."
+        f"{objective} This plan provides {_human_list(selected)}, totalling "
+        f"{total_hours:.0f} instrument-hours{energy_text}, while keeping full-horizon P10 SOC "
+        f"at or above {float(minimum_soc):g}%. It never operates PDU outlets automatically."
     )
     return CL61ScheduleDiagnostic(
         status="safe_schedule",
-        reason_code="safe_priority_schedule",
+        reason_code=reason_code,
         reason=reason,
         base_mode=base_mode,
         base_mode_label=base_label,
@@ -2906,6 +2945,7 @@ def optimize_priority_schedule(
     beam_width: int = 600,
     mode_load_profiles: Mapping[str, StateLoadDynamics] | None = None,
     current_mode: str | None = None,
+    required_active: Mapping[str, Sequence[bool]] | None = None,
     seed: int = 0,
 ) -> ScheduleResult:
     """Jointly maximise safe additive controlled energy across all instruments.
@@ -2914,7 +2954,9 @@ def optimize_priority_schedule(
     instrument-hours. ``priorities`` is a deterministic tie-break, not a set of
     sequential budgets. Learned exact-state startup/fan phases are included in
     the search itself, so a lower-priority addition can be rejected without
-    erasing a safe higher-value subset.
+    erasing a safe higher-value subset. ``required_active`` pins named
+    instruments to a supplied timeline. It is used by the CL61-first policy to
+    reserve the CL61 timetable before Radar and HATPRO are considered.
     """
     controlled = tuple(str(value) for value in priorities)
     if not controlled or len(set(controlled)) != len(controlled):
@@ -2937,6 +2979,17 @@ def optimize_priority_schedule(
     member_count = full_solar.shape[0]
     if components.shape != (member_count, len(COMPONENTS)):
         raise ValueError("Component members must match the solar members and component schema")
+
+    required_by_kit: dict[str, np.ndarray] = {}
+    for kit, values in (required_active or {}).items():
+        if kit not in controlled:
+            raise ValueError(f"Required instrument {kit!r} is not in the controlled schedule")
+        required = np.asarray(values, dtype=bool).reshape(-1)
+        if required.shape != (len(full_times),):
+            raise ValueError(
+                f"Required {kit} activity must match the complete forecast time axis"
+            )
+        required_by_kit[kit] = required
 
     energy_model = battery_model or BatteryModel(
         usable_capacity_kwh=capacity_kwh,
@@ -2970,8 +3023,15 @@ def optimize_priority_schedule(
     discharge_efficiencies = np.clip(discharge_efficiencies, 0.65, 1.0)
 
     fixed_kits = set(mode_kits(base_mode)) - set(controlled)
-    reserve_mode = mode_id(fixed_kits)
-    initial_active = tuple(kit in mode_kits(base_mode) for kit in controlled)
+    initial_active = tuple(
+        bool(required_by_kit[kit][0])
+        if kit in required_by_kit
+        else kit in mode_kits(base_mode)
+        for kit in controlled
+    )
+    initial_mode = mode_id(
+        fixed_kits | {kit for position, kit in enumerate(controlled) if initial_active[position]}
+    )
     component_power_w = {
         kit: max(float(np.nanmedian(components[:, COMPONENT_INDEX[kit]])), 0.0)
         for kit in controlled
@@ -3014,7 +3074,7 @@ def optimize_priority_schedule(
     initial_members = np.full(member_count, float(initial_soc), dtype=np.float64)
     candidates = [
         _AdditiveCandidate(
-            modes=(str(base_mode),),
+            modes=(initial_mode,),
             soc=initial_members,
             active=initial_active,
             # Existing loads were not started by this advisory plan and may be
@@ -3044,6 +3104,12 @@ def optimize_priority_schedule(
         for candidate in candidates:
             for mask in range(1 << len(controlled)):
                 active = tuple(bool(mask & (1 << position)) for position in range(len(controlled)))
+                if any(
+                    bool(required_by_kit[kit][index]) != active[position]
+                    for position, kit in enumerate(controlled)
+                    if kit in required_by_kit
+                ):
+                    continue
                 if any(
                     candidate.active[position]
                     and candidate.run_hours[position] < float(minimum_run_hours) - 1e-9
@@ -3215,14 +3281,22 @@ def optimize_priority_schedule(
         previous_mode = modes[-1]
         segment_start = candidate.segment_start_index
         for index in range(decision_count, len(full_times)):
-            if previous_mode != reserve_mode:
-                previous_mode = reserve_mode
+            required_mode = mode_id(
+                fixed_kits
+                | {
+                    kit
+                    for position, kit in enumerate(controlled)
+                    if kit in required_by_kit and bool(required_by_kit[kit][index])
+                }
+            )
+            if previous_mode != required_mode:
+                previous_mode = required_mode
                 segment_start = index
             step_hours = max(
                 float((full_times[index] - full_times[index - 1]) / pd.Timedelta(hours=1)),
                 0.0,
             )
-            load = segment_load(reserve_mode, segment_start, index)
+            load = segment_load(required_mode, segment_start, index)
             soc = np.clip(
                 soc
                 + _member_soc_delta_percent(
@@ -3237,7 +3311,7 @@ def optimize_priority_schedule(
                 100.0,
             )
             minimum_p10 = min(minimum_p10, float(np.nanquantile(soc, 0.10)))
-            modes.append(reserve_mode)
+            modes.append(required_mode)
         return candidate, tuple(modes), minimum_p10, float(np.nanquantile(soc, 0.10))
 
     evaluated = [extend_candidate(candidate) for candidate in valid]
@@ -3252,10 +3326,20 @@ def optimize_priority_schedule(
             ),
         )
     else:
-        # Preserve the issue-time state at t0, then shed every controlled load.
-        # This is safe only when the fixed baseline itself clears the reserve.
+        # Preserve the issue-time state at t0 and any explicitly required
+        # future activity. A failed schedule must never turn a required CL61
+        # continuation into a deceptively safe all-off trace.
         fallback_modes = tuple(
-            str(base_mode) if index == 0 else reserve_mode
+            initial_mode
+            if index == 0
+            else mode_id(
+                fixed_kits
+                | {
+                    kit
+                    for position, kit in enumerate(controlled)
+                    if kit in required_by_kit and bool(required_by_kit[kit][index])
+                }
+            )
             for index in range(len(full_times))
         )
         fallback_loads = np.empty((member_count, len(full_times)), dtype=np.float64)
@@ -3282,15 +3366,27 @@ def optimize_priority_schedule(
         minimum_p10 = float(np.nanmin(fallback_p10))
         final_p10 = float(fallback_p10[-1])
         modes = fallback_modes
+        fallback_instrument_hours = tuple(
+            _instrument_hours(full_times, fallback_modes, kit, limit=decision_count)
+            for kit in controlled
+        )
+        fallback_starts = tuple(
+            _instrument_starts(fallback_modes, kit, limit=decision_count)
+            for kit in controlled
+        )
+        fallback_energy_wh = sum(
+            fallback_instrument_hours[position] * component_power_w[kit]
+            for position, kit in enumerate(controlled)
+        )
         best = _AdditiveCandidate(
             modes=fallback_modes[:decision_count],
             soc=fallback_soc[:, decision_count - 1],
-            active=tuple(False for _ in controlled),
+            active=tuple(kit in mode_kits(fallback_modes[decision_count - 1]) for kit in controlled),
             run_hours=tuple(0.0 for _ in controlled),
             last_start_days=tuple(None for _ in controlled),
-            starts=tuple(0 for _ in controlled),
-            instrument_hours=tuple(0.0 for _ in controlled),
-            controlled_energy_wh=0.0,
+            starts=fallback_starts,
+            instrument_hours=fallback_instrument_hours,
+            controlled_energy_wh=fallback_energy_wh,
             minimum_p10=minimum_p10,
             first_active_index=None,
             segment_start_index=1 if len(full_times) > 1 else 0,
@@ -3320,6 +3416,109 @@ def optimize_priority_schedule(
         total_instrument_hours=float(sum(instrument_hours.values())),
         controlled_energy_kwh=float(best.controlled_energy_wh / 1000.0),
     )
+
+
+def optimize_cl61_primary_schedule(
+    *,
+    times: pd.DatetimeIndex,
+    solar_members_w: np.ndarray,
+    component_members: np.ndarray,
+    initial_soc: float,
+    capacity_kwh: float,
+    base_mode: str,
+    battery_model: BatteryModel | None = None,
+    member_capacity_kwh: np.ndarray | None = None,
+    member_charge_efficiency: np.ndarray | None = None,
+    member_discharge_efficiency: np.ndarray | None = None,
+    horizon_hours: int = 96,
+    minimum_soc: float = MINIMUM_OPERATIONAL_SOC_PCT,
+    minimum_run_hours: int = MIN_RUN_HOURS,
+    max_starts_per_day: int = MAX_STARTS_PER_UTC_DAY,
+    beam_width: int = 600,
+    mode_load_profiles: Mapping[str, StateLoadDynamics] | None = None,
+    seed: int = 0,
+) -> tuple[ScheduleResult, ScheduleResult]:
+    """Return a CL61-first plan and its reserved CL61 timetable.
+
+    The first pass searches only CL61 against the non-controlled station
+    baseline.  When CL61 is already on, its activity is pinned through the
+    planning horizon instead of silently shedding it at the first decision
+    boundary.  Existing Radar/HATPRO states are also held: the initial
+    controller is CL61-only, so the model must not assume that another live
+    PDU outlet has changed.  The second pass fixes those timelines, then
+    maximises additive Radar/HATPRO use only from residual reserve.  It
+    therefore cannot trade CL61 science for a higher-power combination or
+    claim energy from switching a non-automated live instrument off.
+    """
+    full_times = pd.DatetimeIndex(times)
+    if len(full_times) == 0:
+        raise ValueError("CL61-first optimization requires at least one forecast time")
+    current_kits = set(mode_kits(base_mode))
+    fixed_kits = current_kits - set(OPERATING_PRIORITY)
+    existing_non_cl61 = (current_kits & set(OPERATING_PRIORITY)) - {"CL61"}
+    primary_base_mode = mode_id(fixed_kits | existing_non_cl61)
+    initially_on = "CL61" in current_kits
+    primary_current_mode = mode_id(fixed_kits | existing_non_cl61 | ({"CL61"} if initially_on else set()))
+    required_primary = (
+        {"CL61": np.ones(len(full_times), dtype=bool)} if initially_on else None
+    )
+    primary = optimize_priority_schedule(
+        times=full_times,
+        solar_members_w=solar_members_w,
+        component_members=component_members,
+        initial_soc=initial_soc,
+        capacity_kwh=capacity_kwh,
+        base_mode=primary_base_mode,
+        priorities=("CL61",),
+        battery_model=battery_model,
+        member_capacity_kwh=member_capacity_kwh,
+        member_charge_efficiency=member_charge_efficiency,
+        member_discharge_efficiency=member_discharge_efficiency,
+        horizon_hours=horizon_hours,
+        minimum_soc=minimum_soc,
+        minimum_run_hours=minimum_run_hours,
+        max_starts_per_day=max_starts_per_day,
+        beam_width=max(1, int(beam_width) // 2),
+        mode_load_profiles=mode_load_profiles,
+        current_mode=primary_current_mode,
+        required_active=required_primary,
+        seed=seed,
+    )
+    cl61_timeline = np.asarray(
+        ["CL61" in mode_kits(value) for value in primary.modes], dtype=bool
+    )
+    primary_start_mode = mode_id(fixed_kits | ({"CL61"} if bool(cl61_timeline[0]) else set()))
+    required_combined = {"CL61": cl61_timeline}
+    for kit in existing_non_cl61:
+        required_combined[kit] = np.ones(len(full_times), dtype=bool)
+    combined = optimize_priority_schedule(
+        times=full_times,
+        solar_members_w=solar_members_w,
+        component_members=component_members,
+        initial_soc=initial_soc,
+        capacity_kwh=capacity_kwh,
+        base_mode=primary_start_mode,
+        priorities=OPERATING_PRIORITY,
+        battery_model=battery_model,
+        member_capacity_kwh=member_capacity_kwh,
+        member_charge_efficiency=member_charge_efficiency,
+        member_discharge_efficiency=member_discharge_efficiency,
+        horizon_hours=horizon_hours,
+        minimum_soc=minimum_soc,
+        minimum_run_hours=minimum_run_hours,
+        max_starts_per_day=max_starts_per_day,
+        beam_width=beam_width,
+        mode_load_profiles=mode_load_profiles,
+        # The combined first step is exactly the observed station state: the
+        # reserved CL61 timeline and any other live PDU instruments reproduce
+        # ``base_mode`` at t0.  Preserve its learned phase rather than
+        # spuriously charging an already-running Radar/HATPRO/CL61 startup
+        # transient to the future plan.
+        current_mode=base_mode,
+        required_active=required_combined,
+        seed=seed,
+    )
+    return combined, primary
 
 
 def _schedule_modes(
@@ -3598,7 +3797,7 @@ def build_operating_scenarios(
         current_mode=base_mode,
         horizon_hours=min(optimization_hours, actual_horizon),
     )
-    optimized = optimize_priority_schedule(
+    optimized, cl61_primary = optimize_cl61_primary_schedule(
         times=times,
         solar_members_w=solar_members,
         component_members=planning_component_members,
@@ -3609,44 +3808,49 @@ def build_operating_scenarios(
         member_charge_efficiency=member_charge_efficiency,
         member_discharge_efficiency=member_discharge_efficiency,
         base_mode=base_mode,
-        priorities=OPERATING_PRIORITY,
         horizon_hours=min(optimization_hours, actual_horizon),
         mode_load_profiles=optimizer_profiles,
-        current_mode=base_mode,
         seed=seed,
     )
-    optimized_modes = list(optimized.modes)
-    if len(optimized_modes) < len(times):
-        tail_kits = set(mode_kits(base_mode)) - set(OPERATING_PRIORITY)
-        tail_mode = mode_id(tail_kits)
-        optimized_modes.extend([tail_mode] * (len(times) - len(optimized_modes)))
+    def completed_modes(result: ScheduleResult) -> list[str]:
+        modes = list(result.modes)
+        if len(modes) < len(times):
+            # Outside the explicit decision horizon, retain the actually
+            # observed station state rather than modelling an implicit PDU
+            # switch-off of CL61, Radar, or HATPRO.
+            modes.extend([mode_id(set(mode_kits(base_mode)))] * (len(times) - len(modes)))
+        return modes
 
-    # The joint beam search already uses exact-state startup/fan phases. Repeat
-    # the calculation through the publication path as a contract check; never
-    # erase a safe subset merely because a larger combination was unsafe.
-    phase_validation_fallback = False
-    _, optimized_phase_soc, _ = _scenario_members(
-        optimized_modes,
-        times=times,
-        solar_members=solar_members,
-        component_members=planning_component_members,
-        initial_soc=initial_soc,
-        capacity_kwh=capacity,
-        battery_model=battery_model,
-        member_capacity_kwh=member_capacity,
-        member_charge_efficiency=member_charge_efficiency,
-        member_discharge_efficiency=member_discharge_efficiency,
-        mode_load_profiles=optimizer_profiles,
-        current_mode=base_mode,
-        seed=seed,
-    )
-    optimized_phase_minimum_p10 = float(
-        np.nanmin(np.nanquantile(optimized_phase_soc, 0.10, axis=0))
-    )
-    if optimized.safe and optimized_phase_minimum_p10 < MINIMUM_OPERATIONAL_SOC_PCT - 1e-6:
-        raise ValueError(
-            "Phase-aware additive scheduler produced an inconsistent unsafe publication path"
+    def published_phase_minimum(modes: Sequence[str]) -> float:
+        _, phase_soc, _ = _scenario_members(
+            modes,
+            times=times,
+            solar_members=solar_members,
+            component_members=planning_component_members,
+            initial_soc=initial_soc,
+            capacity_kwh=capacity,
+            battery_model=battery_model,
+            member_capacity_kwh=member_capacity,
+            member_charge_efficiency=member_charge_efficiency,
+            member_discharge_efficiency=member_discharge_efficiency,
+            mode_load_profiles=optimizer_profiles,
+            current_mode=base_mode,
+            seed=seed,
         )
+        return float(np.nanmin(np.nanquantile(phase_soc, 0.10, axis=0)))
+
+    optimized_modes = completed_modes(optimized)
+    optimized_phase_minimum_p10 = published_phase_minimum(optimized_modes)
+    # The secondary search may contain combinations whose exact composed
+    # phase profile is more conservative than its component search estimate.
+    # In that case retain the already-validated CL61-first timetable instead
+    # of publishing an unsafe higher-power combination.
+    phase_validation_fallback = False
+    if optimized.safe and optimized_phase_minimum_p10 < MINIMUM_OPERATIONAL_SOC_PCT - 1e-6:
+        optimized = cl61_primary
+        optimized_modes = completed_modes(optimized)
+        optimized_phase_minimum_p10 = published_phase_minimum(optimized_modes)
+        phase_validation_fallback = True
     p50_continuation_modes = apply_p50_continuation_rule(
         optimized_modes,
         p50_continuation,
@@ -3693,7 +3897,7 @@ def build_operating_scenarios(
         SCENARIO_CURRENT: f"Current: {mode_label(base_mode)}",
         SCENARIO_DC_ONLY: "DC-Only",
         SCENARIO_CL61: "DC + CL61 Continuously On",
-        SCENARIO_OPTIMIZED: "Priority Instrument Schedule",
+        SCENARIO_OPTIMIZED: "CL61-first Instrument Schedule",
         SCENARIO_P50_CONTINUATION: (
             f"P50 continuation: keep {_human_list(p50_continuation.held_instruments)} on"
             if p50_continuation.eligible
@@ -3989,6 +4193,9 @@ def build_operating_scenarios(
         minimum_p10_soc=minimum_p10[optimized_index],
         priorities=OPERATING_PRIORITY,
         controlled_energy_kwh=optimized_controlled_energy_kwh,
+        policy=DEFAULT_SCHEDULE_POLICY,
+        continuation_required=("CL61" in mode_kits(base_mode)),
+        held_instruments=(set(mode_kits(base_mode)) & set(OPERATING_PRIORITY)) - {"CL61"},
     )
 
     output = xr.Dataset(
@@ -4107,12 +4314,26 @@ def build_operating_scenarios(
             "operating_decision_horizon_hours": str(min(optimization_hours, actual_horizon)),
             "operating_safety_constraint": f"P10 SOC >= {MINIMUM_OPERATIONAL_SOC_PCT:g}% across the full planning horizon",
             "operating_optimization_objective": (
-                "maximize additive controlled energy, then total instrument-hours; use "
-                "CL61, Radar, HATPRO priority order to break otherwise-equivalent plans "
-                "within the 96-hour decision horizon"
+                "reserve the feasible CL61 timetable first, then maximize Radar and HATPRO "
+                "within the residual reserve; preserve an already-on CL61 through the planning horizon"
             ),
+            "operating_schedule_policy": DEFAULT_SCHEDULE_POLICY,
+            "operating_available_schedule_policies": json.dumps(
+                [SCHEDULE_POLICY_CL61_PRIMARY, SCHEDULE_POLICY_ENERGY_MAXIMISING]
+            ),
+            "optimized_schedule_policy": DEFAULT_SCHEDULE_POLICY,
             "optimized_priority_order": json.dumps(list(OPERATING_PRIORITY)),
             "optimized_controlled_instruments": json.dumps(list(OPERATING_PRIORITY)),
+            "optimized_held_existing_instruments": json.dumps(
+                sorted((set(mode_kits(base_mode)) & set(OPERATING_PRIORITY)) - {"CL61"})
+            ),
+            "cl61_primary_reserved_hours": f"{cl61_primary.collection_hours:.6g}",
+            "cl61_primary_minimum_p10_soc": f"{cl61_primary.minimum_p10_soc:.6g}",
+            "cl61_primary_safe": str(cl61_primary.safe).lower(),
+            "cl61_primary_starts": str(cl61_primary.starts),
+            "cl61_primary_continuation_required": str("CL61" in mode_kits(base_mode)).lower(),
+            "energy_maximising_comparison_policy": SCHEDULE_POLICY_ENERGY_MAXIMISING,
+            "energy_maximising_comparison_status": "available_on_request",
             "optimized_instrument_hours": json.dumps(optimized_instrument_hours, sort_keys=True),
             "optimized_instrument_starts": json.dumps(optimized_instrument_starts, sort_keys=True),
             "optimized_total_instrument_hours": f"{optimized_total_instrument_hours:.6g}",
