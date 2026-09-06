@@ -6,17 +6,26 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
+import pandas as pd
 import xarray as xr
+from dask import array as da
 
 from generate_power_display_summary import (
     _open_optional_zarr,
+    _recent_observation_views,
     _release_generation_lock,
     _section_subset,
     _try_generation_lock,
+    _validated_history_days,
     _write_metadata,
     _write_zarr_atomic,
 )
-from grouped_timeseries import POWER_PANEL_TIME_GROUP_BY_KEY, SUMMARY_LAYOUTS
+from grouped_timeseries import (
+    POWER_DISPLAY_ENERGY_MAP,
+    POWER_PANEL_TIME_GROUP_BY_KEY,
+    SUMMARY_LAYOUTS,
+    build_power_display_summary_dataset,
+)
 
 
 class PowerDisplaySummaryMetadataTests(unittest.TestCase):
@@ -107,6 +116,73 @@ class PowerDisplaySummaryMetadataTests(unittest.TestCase):
 
             np.testing.assert_array_equal(snapshot["soc"].values, [[90.0, 91.0]])
             self.assertEqual(snapshot.sizes["time"], 2)
+
+    def test_recent_observation_view_keeps_arrays_lazy_and_prunes_fields(self) -> None:
+        times = pd.date_range("2026-07-01T00:00:00", periods=12 * 24 + 1, freq="1h")
+        source_values = da.arange(len(times), chunks=24)
+        power = xr.Dataset(
+            {
+                "BatterySOC": (("time",), source_values),
+                "unused": (("time",), source_values + 1),
+            },
+            coords={"time": times},
+        )
+
+        recent, _ass, _pdu, start, end = _recent_observation_views(
+            power,
+            None,
+            None,
+            history_days=8,
+        )
+
+        self.assertEqual(start, pd.Timestamp("2026-07-05T00:00:00"))
+        self.assertEqual(end, pd.Timestamp("2026-07-13T00:00:00"))
+        self.assertNotIn("unused", recent)
+        self.assertIsInstance(recent["BatterySOC"].data, da.Array)
+        self.assertLess(recent.sizes["time"], power.sizes["time"])
+
+    def test_recent_observation_summary_matches_full_history_inside_retained_window(self) -> None:
+        times = pd.date_range("2026-07-01T00:00:00", periods=12 * 24 * 6, freq="10min")
+        within_day = (times.hour * 6 + times.minute // 10).to_numpy(dtype=np.float64)
+        power = xr.Dataset(
+            {
+                "BatterySOC": (("time",), 85.0 - np.arange(len(times), dtype=np.float64) / 10000.0),
+                "ACOutputWatts": (("time",), 100.0 + np.sin(np.arange(len(times)) / 17.0)),
+                "DCInverterWatts": (("time",), np.full(len(times), 25.0)),
+                "SolarYield_East": (("time",), within_day * 0.01),
+                "SolarYield_South": (("time",), within_day * 0.02),
+                "SolarYield_West": (("time",), within_day * 0.03),
+            },
+            coords={"time": times},
+        )
+        ass = xr.Dataset(
+            {"watts_on_48vdc_Avg": (("time",), np.full(len(times), 42.0))},
+            coords={"time": times},
+        )
+        pdu = xr.Dataset(
+            {"PDUOutlet5Watts": (("time",), np.full(len(times), 31.0))},
+            coords={"time": times},
+        )
+        full = build_power_display_summary_dataset(power, ass, pdu, freq="1h")
+
+        recent_power, recent_ass, recent_pdu, start, end = _recent_observation_views(
+            power.chunk({"time": 144}),
+            ass.chunk({"time": 144}),
+            pdu.chunk({"time": 144}),
+            history_days=8,
+        )
+        recent = build_power_display_summary_dataset(recent_power, recent_ass, recent_pdu, freq="1h")
+        expected = full.sel(time=slice(start, end))
+
+        xr.testing.assert_allclose(recent, expected)
+        for name in POWER_DISPLAY_ENERGY_MAP.values():
+            if name in expected:
+                np.testing.assert_allclose(recent[name], expected[name], equal_nan=True)
+
+    def test_history_shorter_than_display_contract_is_rejected(self) -> None:
+        for value in (7, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "must retain at least"):
+                _validated_history_days(value)
 
 
 if __name__ == "__main__":

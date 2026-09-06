@@ -6,23 +6,37 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 import xarray as xr
 import zarr
 
 from grouped_timeseries import (
+    PDU_DISPLAY_SUMMARY_FIELDS,
+    POWER_CUMULATIVE_CONTEXT_DAYS,
     POWER_DISPLAY_ENERGY_ATTR,
     POWER_DISPLAY_ENERGY_MAP,
     POWER_DISPLAY_SUMMARY_ATTR,
+    POWER_DISPLAY_SUMMARY_CONTEXT_FIELDS,
+    POWER_DISPLAY_SUMMARY_FIELDS,
     POWER_DISPLAY_SUMMARY_FREQ,
     POWER_PANEL_TIME_GROUP_BY_KEY,
     SUMMARY_LAYOUTS,
     build_power_display_summary_dataset,
+)
+
+POWER_DISPLAY_MIN_HISTORY_DAYS = max(4.0, float(POWER_CUMULATIVE_CONTEXT_DAYS) + 1.0)
+POWER_DISPLAY_HISTORY_DAYS = float(
+    os.environ.get("AURORA_POWER_DISPLAY_HISTORY_DAYS", str(max(14.0, POWER_DISPLAY_MIN_HISTORY_DAYS)))
+)
+POWER_DISPLAY_SOURCE_FIELDS = tuple(
+    dict.fromkeys(POWER_DISPLAY_SUMMARY_FIELDS + tuple(POWER_DISPLAY_ENERGY_MAP))
 )
 
 POWER_ZARR_PATH = Path(os.environ.get("POWER_ZARR_PATH", "/data/aurora/products/power/power.zarr"))
@@ -81,6 +95,13 @@ def _write_metadata(output_zarr: Path, display: xr.Dataset) -> Path:
         "time_start_utc": str(times[0]) if len(times) else "",
         "time_end_utc": str(times[-1]) if len(times) else "",
     }
+    for name in (
+        "observation_history_days",
+        "observation_window_start_utc",
+        "observation_window_end_utc",
+    ):
+        if name in display.attrs:
+            payload[name] = str(display.attrs[name])
     path = _metadata_path(output_zarr)
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -130,6 +151,86 @@ def _open_optional_zarr(
                 time.sleep(0.2)
     print(f"Could not open {label} Zarr for Power display summary: {last_error}")
     return None
+
+
+def _validated_history_days(history_days: float) -> float:
+    """Validate the retained observed window needed by every Power surface."""
+    value = float(history_days)
+    if not math.isfinite(value) or value < POWER_DISPLAY_MIN_HISTORY_DAYS:
+        raise ValueError(
+            "Power display history must retain at least "
+            f"{POWER_DISPLAY_MIN_HISTORY_DAYS:g} days (96-hour mobile coverage and "
+            f"{POWER_CUMULATIVE_CONTEXT_DAYS}-day cumulative context)"
+        )
+    return value
+
+
+def _time_window_view(
+    dataset: xr.Dataset | None,
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp | None,
+    fields: tuple[str, ...] | None = None,
+) -> xr.Dataset | None:
+    """Return a lazy, field-pruned time view without reading source data arrays."""
+    if dataset is None or "time" not in dataset or dataset.sizes.get("time", 0) == 0:
+        return dataset
+    if fields is not None:
+        names = [name for name in fields if name in dataset]
+        dataset = dataset[names]
+    times = pd.DatetimeIndex(dataset["time"].values)
+    if times.is_monotonic_increasing:
+        return dataset.sel(time=slice(start, end))
+    mask = (~times.isna()) & (times >= start)
+    if end is not None:
+        mask &= times <= end
+    return dataset.isel(time=mask)
+
+
+def _recent_observation_views(
+    power: xr.Dataset,
+    ass_logger: xr.Dataset | None,
+    pdu: xr.Dataset | None,
+    *,
+    history_days: float,
+) -> tuple[xr.Dataset, xr.Dataset | None, xr.Dataset | None, pd.Timestamp, pd.Timestamp]:
+    """Crop high-rate observations before pandas can materialise full history.
+
+    APS currently contains millions of one-second rows. Only the recent live
+    window is needed by the precomputed display products; older interactive
+    requests continue to use the dashboard's existing raw-Zarr fallback.
+    Starting at UTC midnight preserves the daily cumulative-energy traces for
+    every retained day.
+    """
+    retained_days = _validated_history_days(history_days)
+    if "time" not in power or power.sizes.get("time", 0) == 0:
+        raise ValueError("Power Zarr contains no time samples")
+    times = pd.DatetimeIndex(power["time"].values)
+    valid_times = times[~times.isna()]
+    if not len(valid_times):
+        raise ValueError("Power Zarr contains no valid timestamps")
+    end = pd.Timestamp(valid_times.max())
+    start = (end - pd.Timedelta(days=retained_days)).normalize()
+    recent_power = _time_window_view(
+        power,
+        start=start,
+        end=end,
+        fields=POWER_DISPLAY_SOURCE_FIELDS,
+    )
+    recent_ass_logger = _time_window_view(
+        ass_logger,
+        start=start,
+        end=end,
+        fields=POWER_DISPLAY_SUMMARY_CONTEXT_FIELDS,
+    )
+    recent_pdu = _time_window_view(
+        pdu,
+        start=start,
+        end=end,
+        fields=PDU_DISPLAY_SUMMARY_FIELDS,
+    )
+    assert recent_power is not None
+    return recent_power, recent_ass_logger, recent_pdu, start, end
 
 
 def _energy_subset(summary: xr.Dataset, freq: str) -> xr.Dataset:
@@ -236,11 +337,18 @@ def _generate_unlocked(
     forecast_output_zarr: Path | None = POWER_FORECAST_DISPLAY_ZARR_PATH,
     manifest_path: Path | None = POWER_DISPLAY_MANIFEST_PATH,
     freq: str = POWER_DISPLAY_SUMMARY_FREQ,
+    history_days: float = POWER_DISPLAY_HISTORY_DAYS,
 ) -> Path:
     """Build the derived one-minute display-summary store from Power inputs."""
     power = xr.open_zarr(power_zarr, chunks={})
     ass_logger = _open_optional_zarr(ass_logger_zarr, "ASFS logger")
     pdu = _open_optional_zarr(pdu_zarr, "ASS PDU")
+    power, ass_logger, pdu, observation_start, observation_end = _recent_observation_views(
+        power,
+        ass_logger,
+        pdu,
+        history_days=history_days,
+    )
     forecast = _open_optional_zarr(forecast_zarr, "Power SOC forecast", eager=True)
     forecast_skill = _open_optional_zarr(forecast_skill_zarr, "Power SOC forecast skill", eager=True)
     hindcast = _open_optional_zarr(hindcast_zarr, "Power SOC hindcast", eager=True)
@@ -275,6 +383,9 @@ def _generate_unlocked(
         raise ValueError("No display-summary samples could be generated from the Power Zarr")
 
     display.attrs[POWER_DISPLAY_SUMMARY_ATTR] = "true"
+    display.attrs["observation_history_days"] = f"{float(history_days):g}"
+    display.attrs["observation_window_start_utc"] = observation_start.isoformat()
+    display.attrs["observation_window_end_utc"] = observation_end.isoformat()
     _write_zarr_atomic(display, output_zarr)
     metadata_path = _write_metadata(output_zarr, display)
     print(f"Wrote {output_zarr} with {display.sizes.get('time', 0)} samples and {len(display.data_vars)} variables")
@@ -341,6 +452,15 @@ def main() -> None:
     parser.add_argument("--manifest-path", type=Path, default=POWER_DISPLAY_MANIFEST_PATH)
     parser.add_argument("--no-energy-output", action="store_true", help="Do not refresh the legacy cumulative-energy display Zarr")
     parser.add_argument("--freq", default=POWER_DISPLAY_SUMMARY_FREQ)
+    parser.add_argument(
+        "--history-days",
+        type=float,
+        default=POWER_DISPLAY_HISTORY_DAYS,
+        help=(
+            "Observed history retained in compact display products "
+            f"(default: {POWER_DISPLAY_HISTORY_DAYS:g}; minimum: {POWER_DISPLAY_MIN_HISTORY_DAYS:g})"
+        ),
+    )
     parser.add_argument("--write-metadata-only", action="store_true")
     args = parser.parse_args()
     if args.write_metadata_only:
@@ -362,6 +482,7 @@ def main() -> None:
         forecast_output_zarr=args.forecast_output_zarr,
         manifest_path=args.manifest_path,
         freq=args.freq,
+        history_days=args.history_days,
     )
 
 
