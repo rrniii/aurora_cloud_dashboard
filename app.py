@@ -1522,16 +1522,19 @@ def _status_time_index(inst: str) -> pd.DatetimeIndex:
 
 
 def _format_status_time(dt: datetime | None) -> str:
-    if dt is None:
+    stamp = _as_naive_utc_datetime(dt)
+    if stamp is None:
         return "No data"
-    stamp = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    return stamp.strftime("%H:%M UTC")
+    return stamp.replace(tzinfo=timezone.utc).strftime("%H:%M UTC")
 
 
 def _format_duration(delta: timedelta | None) -> str:
-    if delta is None:
+    if delta is None or pd.isna(delta):
         return "n/a"
-    total_seconds = max(int(delta.total_seconds()), 0)
+    total_seconds_value = delta.total_seconds()
+    if not np.isfinite(total_seconds_value):
+        return "n/a"
+    total_seconds = max(int(total_seconds_value), 0)
     days, rem = divmod(total_seconds, 86400)
     hours, rem = divmod(rem, 3600)
     minutes, _seconds = divmod(rem, 60)

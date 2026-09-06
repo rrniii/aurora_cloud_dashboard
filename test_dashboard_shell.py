@@ -40,6 +40,25 @@ class DashboardShellTests(TestCase):
 
         self.assertEqual(resolved, latest_path)
 
+    def test_status_formatters_reject_non_finite_timestamp_and_duration(self) -> None:
+        self.assertEqual(app._format_status_time(pd.NaT), "No data")
+        self.assertEqual(app._format_duration(pd.NaT), "n/a")
+
+    def test_power_status_markup_survives_nat_latest_bound(self) -> None:
+        start = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        end = datetime(2026, 9, 6, tzinfo=timezone.utc)
+        with (
+            patch.object(app, "instrument_select", SimpleNamespace(value="power")),
+            patch.object(app, "range_start", SimpleNamespace(value=start)),
+            patch.object(app, "range_end", SimpleNamespace(value=end)),
+            patch.object(app, "_dataset_time_bounds", return_value=(pd.NaT, pd.NaT)),
+            patch.object(app, "_status_time_index", return_value=pd.DatetimeIndex([])),
+        ):
+            markup = app._current_interactive_status_markup()
+
+        self.assertIn("No data", markup)
+        self.assertIn("n/a", markup)
+
     def test_auroracam_detail_panes_refresh_without_rebuilding_thumbnail_grid(self) -> None:
         with patch.object(app, "_auroracam_viewer_markup", return_value="<div>selected camera</div>") as render:
             app._refresh_auroracam_detail()
