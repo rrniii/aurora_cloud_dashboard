@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
+from generate_power_prod_dev_evaluation import (
+    EvaluationInterrupted,
+    _raise_interrupted,
+    run_evaluation,
+)
 from power_prod_dev_evaluation import (
+    attach_paired_observations,
     build_exact_intersection_evidence,
+    paired_observation_view,
     paired_score_surface,
     write_paired_products,
 )
@@ -75,6 +85,92 @@ def test_exact_intersection_deduplicates_cached_cycle_rows_and_scores() -> None:
     assert soc["developmentMAEImprovementFraction"] == 0.5
 
 
+def test_sparse_paired_observations_preserve_full_history_scores() -> None:
+    times = pd.date_range("2026-08-01", "2026-09-02", freq="5min")
+    ramp = np.linspace(90.0, 50.0, len(times))
+    power = xr.Dataset(
+        {
+            "BatterySOC": (("time",), ramp),
+            "SolarWatts_East": (("time",), np.full(len(times), 10.0)),
+            "SolarWatts_South": (("time",), np.full(len(times), 20.0)),
+            "SolarWatts_West": (("time",), np.full(len(times), 30.0)),
+            "ACOutputWatts": (("time",), np.full(len(times), 80.0)),
+            "DCInverterWatts": (("time",), np.full(len(times), 20.0)),
+            "UnusedDiagnostic": (("time",), np.arange(len(times), dtype=float)),
+        },
+        coords={"time": times},
+    ).chunk({"time": 288})
+    production = _archive(2.0)
+    development = _archive(1.0)
+
+    full = build_exact_intersection_evidence(
+        production,
+        development,
+        power=power.compute(),
+    )
+    paired = build_exact_intersection_evidence(production, development)
+    view = paired_observation_view(power, paired)
+    sparse = attach_paired_observations(paired, view.compute())
+
+    assert view.sizes["time"] == 2
+    assert "UnusedDiagnostic" not in view
+    for name in ("soc", "solar", "load"):
+        np.testing.assert_allclose(
+            sparse[f"observed_{name}"].values,
+            full[f"observed_{name}"].values,
+        )
+    full_score = paired_score_surface(full, bootstrap_samples=0)
+    sparse_score = paired_score_surface(sparse, bootstrap_samples=0)
+    assert sparse_score["leadBuckets"] == full_score["leadBuckets"]
+
+
+def test_paired_observation_view_remains_lazy_sparse_and_field_pruned() -> None:
+    times = pd.date_range("2026-01-01", periods=100_000, freq="1min")
+    values = np.arange(len(times), dtype=float)
+    power = xr.Dataset(
+        {
+            "BatterySOC": (("time",), values),
+            "ACOutputWatts": (("time",), values),
+            "UnusedDiagnostic": (("time",), values),
+        },
+        coords={"time": times},
+    ).chunk({"time": 1_000})
+    targets = times[[50, 50_000, 99_950]] + pd.Timedelta(seconds=20)
+    evidence = xr.Dataset(
+        {"valid_time": (("record",), targets.to_numpy(dtype="datetime64[ns]"))},
+        coords={"record": np.arange(len(targets))},
+    )
+
+    selected = paired_observation_view(power, evidence)
+
+    assert selected.sizes["time"] == 3
+    assert set(selected.data_vars) == {"BatterySOC", "ACOutputWatts"}
+    assert selected["BatterySOC"].chunks is not None
+    assert selected.attrs["paired_observation_selection"] == "nearest_unique_valid_times"
+    assert selected.attrs["paired_observation_target_count"] == 3
+    assert selected.attrs["paired_observation_sample_count"] == 3
+
+
+def test_custom_observation_tolerance_is_preserved_through_attachment() -> None:
+    source_time = pd.DatetimeIndex(["2026-09-01T03:00:00"])
+    target_time = pd.DatetimeIndex(["2026-09-01T03:15:00"])
+    power = xr.Dataset(
+        {"BatterySOC": (("time",), [71.0])},
+        coords={"time": source_time},
+    ).chunk({"time": 1})
+    evidence = xr.Dataset(
+        {"valid_time": (("record",), target_time.to_numpy(dtype="datetime64[ns]"))},
+        coords={"record": [0]},
+    )
+    tolerance = pd.Timedelta(minutes=20)
+
+    selected = paired_observation_view(power, evidence, tolerance=tolerance).compute()
+    attached = attach_paired_observations(evidence, selected, tolerance=tolerance)
+
+    assert attached["observed_soc"].item() == 71.0
+    assert attached.attrs["paired_observation_match_tolerance_seconds"] == 1200.0
+
+
 def test_paired_products_are_separate_and_append_history() -> None:
     evidence = build_exact_intersection_evidence(_archive(2.0), _archive(1.0))
     with TemporaryDirectory() as temporary:
@@ -97,6 +193,94 @@ def test_paired_products_are_separate_and_append_history() -> None:
 
     assert first["pairedRows"] == 2
     assert len(history) == 2
+
+
+def test_empty_pairing_skips_invalid_power_store_and_records_lifecycle() -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        prod = root / "prod.zarr"
+        dev = root / "dev.zarr"
+        invalid_power = root / "invalid-power.zarr"
+        output = root / "paired.zarr"
+        status = root / "status.json"
+        history = root / "history.jsonl"
+        _archive(2.0, source_cycle_set_id="prod-cycle").to_zarr(prod)
+        _archive(1.0, source_cycle_set_id="dev-cycle").to_zarr(dev)
+        invalid_power.mkdir()
+
+        summary = run_evaluation(
+            prod_archive_zarr=prod,
+            dev_archive_zarr=dev,
+            power_zarr=invalid_power,
+            output_zarr=output,
+            status_json=status,
+            history_jsonl=history,
+            bootstrap_samples=0,
+        )
+        current = json.loads(status.read_text(encoding="utf-8"))
+        events = [
+            json.loads(line)
+            for line in history.read_text(encoding="utf-8").splitlines()
+        ]
+
+    assert summary["status"] == "insufficient_evidence"
+    assert summary["evidenceStatus"] == "all_candidate_pairs_rejected"
+    assert summary["candidateBaseIntersectionRows"] == 4
+    assert summary["reasonCode"] == "prod_dev_evaluation_all_candidate_pairs_rejected"
+    assert current["status"] == "insufficient_evidence"
+    assert [event["status"] for event in events] == ["running", "insufficient_evidence"]
+    assert all(event.get("eventDigest") for event in events)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "reason_fragment"),
+    [
+        (RuntimeError("broken archive"), "failed", "RuntimeError"),
+        (EvaluationInterrupted("SIGTERM"), "interrupted", "SIGTERM"),
+    ],
+)
+def test_failed_or_interrupted_evaluation_preserves_prior_output_and_appends_status(
+    failure: Exception,
+    expected_status: str,
+    reason_fragment: str,
+) -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        output = root / "paired.zarr"
+        output.mkdir()
+        marker = output / "prior-evidence"
+        marker.write_text("immutable prior result", encoding="utf-8")
+        status = root / "status.json"
+        history = root / "history.jsonl"
+        with patch(
+            "generate_power_prod_dev_evaluation._materialise_evidence",
+            side_effect=failure,
+        ):
+            with pytest.raises(type(failure)):
+                run_evaluation(
+                    prod_archive_zarr=root / "prod.zarr",
+                    dev_archive_zarr=root / "dev.zarr",
+                    power_zarr=root / "power.zarr",
+                    output_zarr=output,
+                    status_json=status,
+                    history_jsonl=history,
+                    bootstrap_samples=0,
+                )
+        current = json.loads(status.read_text(encoding="utf-8"))
+        events = [
+            json.loads(line)
+            for line in history.read_text(encoding="utf-8").splitlines()
+        ]
+
+        assert marker.read_text(encoding="utf-8") == "immutable prior result"
+    assert current["status"] == expected_status
+    assert reason_fragment in current["reasonCode"]
+    assert [event["status"] for event in events] == ["running", expected_status]
+
+
+def test_sigterm_handler_converts_signal_to_recordable_interruption() -> None:
+    with pytest.raises(EvaluationInterrupted, match="SIGTERM"):
+        _raise_interrupted(15, None)
 
 
 def test_exact_intersection_rejects_source_mode_and_unknown_anchor() -> None:

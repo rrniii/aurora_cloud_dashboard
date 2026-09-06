@@ -9,6 +9,7 @@ separate development evidence product.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,16 @@ FORECAST_FIELDS = {
     "solar": "ForecastSolarWatts",
     "load": "ForecastLoadWatts",
 }
+
+POWER_OBSERVATION_FIELDS = (
+    "BatterySOC",
+    "SolarWatts_East",
+    "SolarWatts_South",
+    "SolarWatts_West",
+    "ACOutputWatts",
+    "DCInverterWatts",
+)
+OBSERVATION_MATCH_TOLERANCE = pd.Timedelta(minutes=10)
 
 
 def _issue_text(archive: xr.Dataset, name: str, issue_count: int) -> np.ndarray:
@@ -158,6 +169,93 @@ def _observations(power: xr.Dataset | None) -> dict[str, pd.Series]:
     return values
 
 
+def paired_observation_view(
+    power: xr.Dataset,
+    evidence: xr.Dataset,
+    *,
+    tolerance: pd.Timedelta = OBSERVATION_MATCH_TOLERANCE,
+) -> xr.Dataset:
+    """Return the lazy APS samples sufficient to score every paired row.
+
+    The raw APS store contains millions of one-second samples.  Paired scoring
+    needs only the nearest sample (within the evaluator tolerance) for each
+    exact valid time.  Resolve those positions from the time coordinate, then
+    retain only the six physical observation fields before any data variable
+    is loaded.  This is mathematically equivalent to reindexing the complete
+    history because every globally nearest in-tolerance sample is retained.
+    """
+
+    if "time" not in power.coords:
+        raise ValueError("APS power dataset has no time coordinate")
+    fields = [name for name in POWER_OBSERVATION_FIELDS if name in power]
+    source = power[fields]
+    if evidence.sizes.get("record", 0) == 0 or "valid_time" not in evidence:
+        return source.isel(time=slice(0, 0))
+    times = pd.DatetimeIndex(power["time"].values)
+    if times.hasnans:
+        raise ValueError("APS power time coordinate contains invalid timestamps")
+    if not times.is_monotonic_increasing or times.has_duplicates:
+        raise ValueError("APS power time coordinate must be unique and monotonic")
+    targets = pd.DatetimeIndex(evidence["valid_time"].values).dropna().unique().sort_values()
+    if not len(targets):
+        return source.isel(time=slice(0, 0))
+    tolerance = pd.Timedelta(tolerance)
+    if tolerance < pd.Timedelta(0):
+        raise ValueError("Observation matching tolerance cannot be negative")
+    positions = times.get_indexer(targets, method="nearest", tolerance=tolerance)
+    positions = np.unique(positions[positions >= 0])
+    selected = (
+        source.isel(time=positions)
+        if len(positions)
+        else source.isel(time=slice(0, 0))
+    )
+    selected.attrs = dict(selected.attrs)
+    selected.attrs.update(
+        {
+            "paired_observation_selection": "nearest_unique_valid_times",
+            "paired_observation_match_tolerance_seconds": float(
+                tolerance / pd.Timedelta(seconds=1)
+            ),
+            "paired_observation_target_start_utc": pd.Timestamp(targets.min()).isoformat(),
+            "paired_observation_target_end_utc": pd.Timestamp(targets.max()).isoformat(),
+            "paired_observation_target_count": int(len(targets)),
+            "paired_observation_sample_count": int(len(positions)),
+        }
+    )
+    return selected
+
+
+def attach_paired_observations(
+    evidence: xr.Dataset,
+    power: xr.Dataset | None,
+    *,
+    tolerance: pd.Timedelta = OBSERVATION_MATCH_TOLERANCE,
+) -> xr.Dataset:
+    """Attach retrospective observations without changing the paired cohort."""
+
+    if power is None or evidence.sizes.get("record", 0) == 0:
+        return evidence
+    paired = evidence.copy()
+    paired.attrs.update(
+        {
+            name: value
+            for name, value in power.attrs.items()
+            if name.startswith("paired_observation_")
+        }
+    )
+    targets = pd.DatetimeIndex(paired["valid_time"].values)
+    for name, series in _observations(power).items():
+        paired[f"observed_{name}"] = (
+            ("record",),
+            series.reindex(
+                targets,
+                method="nearest",
+                tolerance=pd.Timedelta(tolerance),
+            ).to_numpy(dtype=np.float64),
+        )
+    return paired
+
+
 def build_exact_intersection_evidence(
     production: xr.Dataset,
     development: xr.Dataset,
@@ -275,13 +373,6 @@ def build_exact_intersection_evidence(
         )[:20]
         for _, row in paired.iterrows()
     ]
-    observations = _observations(power)
-    for name, series in observations.items():
-        paired[f"observed_{name}"] = series.reindex(
-            pd.DatetimeIndex(paired["valid_time"]),
-            method="nearest",
-            tolerance=pd.Timedelta(minutes=10),
-        ).to_numpy(dtype=float)
     paired["lead_hours"] = paired["lead_hours_development"]
     output_columns = [
         "issue_time",
@@ -312,7 +403,6 @@ def build_exact_intersection_evidence(
         "cloud_regime",
         *(f"production_{name}" for name in FORECAST_FIELDS),
         *(f"development_{name}" for name in FORECAST_FIELDS),
-        *(f"observed_{name}" for name in observations),
     ]
     variables: dict[str, tuple[tuple[str], np.ndarray]] = {}
     for name in output_columns:
@@ -324,7 +414,7 @@ def build_exact_intersection_evidence(
         else:
             array = values.fillna("").astype(str).to_numpy(dtype="U512")
         variables[name] = (("record",), array)
-    return xr.Dataset(
+    evidence = xr.Dataset(
         variables,
         coords={"record": np.arange(len(paired), dtype=np.int64)},
         attrs={
@@ -344,6 +434,7 @@ def build_exact_intersection_evidence(
             ),
         },
     )
+    return attach_paired_observations(evidence, power)
 
 
 def _paired_metric(
@@ -463,6 +554,10 @@ def paired_score_surface(
             "dataUpdatedAt": utc_now_iso(),
             "pairedRows": 0,
             "pairedIndependentCycles": 0,
+            "evidenceStatus": str(evidence.attrs.get("status", "no_exact_intersection")),
+            "candidateBaseIntersectionRows": int(
+                evidence.attrs.get("candidate_base_intersection_rows", 0)
+            ),
             "campaignDiversity": _campaign_diversity(pd.DataFrame()),
             "leadBuckets": {},
             "rejectionCounts": json.loads(
@@ -549,6 +644,10 @@ def paired_score_surface(
         "pairedIndependentCycles": int(cohort_frame["source_cycle_set_id"].nunique()),
         "pairedUTCDays": int(cohort_frame["issue_time"].dt.floor("D").nunique()),
         "totalExactIntersectionRows": int(len(frame)),
+        "evidenceStatus": str(evidence.attrs.get("status", "complete")),
+        "candidateBaseIntersectionRows": int(
+            evidence.attrs.get("candidate_base_intersection_rows", len(frame))
+        ),
         "activeCohortID": active_cohort,
         "cohorts": cohort_inventory,
         "campaignDiversity": _campaign_diversity(cohort_frame),
@@ -571,13 +670,34 @@ def write_paired_products(
     status_json: Path,
     history_jsonl: Path,
     bootstrap_samples: int = 500,
+    status_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _atomic_write_zarr(evidence, Path(output_zarr))
     summary = paired_score_surface(evidence, bootstrap_samples=bootstrap_samples)
-    _write_state(Path(status_json), summary)
-    history_jsonl = Path(history_jsonl)
-    history_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    event = {**summary, "eventDigest": stable_json_digest(summary)}
-    with history_jsonl.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
+    if status_context:
+        summary = {**summary, **status_context}
+    write_evaluation_status_event(
+        status_json=Path(status_json),
+        history_jsonl=Path(history_jsonl),
+        event=summary,
+    )
     return summary
+
+
+def write_evaluation_status_event(
+    *,
+    status_json: Path,
+    history_jsonl: Path,
+    event: dict[str, Any],
+) -> None:
+    """Atomically replace current status and append an immutable run event."""
+
+    status_json = Path(status_json)
+    history_jsonl = Path(history_jsonl)
+    _write_state(status_json, event)
+    history_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    history_event = {**event, "eventDigest": stable_json_digest(event)}
+    with history_jsonl.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(history_event, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
