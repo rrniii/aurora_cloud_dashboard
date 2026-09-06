@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -204,6 +205,110 @@ class DashboardShellTests(TestCase):
         self.assertIn("forecast-plot-info-control", card.objects[0].css_classes)
         self.assertIsInstance(card.objects[-1], app.pn.pane.Plotly)
         self.assertIn("desktop-power-figure", card.objects[-1].css_classes)
+
+    def test_custom_operating_plan_clips_to_96_hours_and_distinguishes_quantiles(self) -> None:
+        anchor = pd.Timestamp("2026-09-06T00:00:00")
+        times = pd.date_range(anchor, anchor + pd.Timedelta(hours=240), freq="1h")
+        result = {
+            "time": times,
+            "modes": ["dc_only"] * len(times),
+            "kit": "CL61",
+            "mode_codes": np.zeros(len(times), dtype=np.int16),
+            "load_p50_w": np.full(len(times), 250.0),
+            "soc_p10": np.linspace(88.0, 20.0, len(times)),
+            "soc_p50": np.linspace(90.0, 24.0, len(times)),
+            "soc_p90": np.linspace(92.0, 28.0, len(times)),
+            "below_40_probability": np.zeros(len(times)),
+            "collection_hours": 12.0,
+            "minimum_p10_soc": 20.0,
+            "final_p10_soc": 20.0,
+            "safe": False,
+        }
+        scenarios = xr.Dataset(
+            attrs={
+                "current_mode_label": "DC-Only",
+                "current_mode_maturity": "observed",
+                "current_mode_confidence": "1",
+            }
+        )
+
+        with (
+            patch.object(app, "_get_power_operating_scenarios_dataset", return_value=scenarios),
+            patch.object(app, "evaluate_custom_schedule", return_value=result),
+        ):
+            view = app._build_custom_cl61_plan_view(anchor, 12, "CL61")
+
+        plot = next(item for item in view.objects if isinstance(item, app.pn.pane.Plotly))
+        figure = plot.object
+        expected_end = anchor + pd.Timedelta(hours=96)
+        for trace in figure.data:
+            trace_times = pd.DatetimeIndex(pd.to_datetime(trace.x))
+            self.assertGreaterEqual(trace_times.min(), anchor, trace.name)
+            self.assertLessEqual(trace_times.max(), expected_end, trace.name)
+        traces = {trace.name: trace for trace in figure.data}
+        p10 = traces["SOC P10"]
+        p50 = traces["SOC Median"]
+        p90 = traces["SOC P90"]
+        self.assertNotEqual(p10.line.color, p90.line.color)
+        self.assertNotEqual(p10.line.dash or "solid", p90.line.dash or "solid")
+        self.assertGreater(p50.line.width, max(p10.line.width, p90.line.width))
+
+    def test_missing_power_forecast_warning_has_explicit_visible_contrast(self) -> None:
+        with patch.object(app, "_open_power_display_summary_window", return_value=None):
+            warning = app._browser_power_briefing(
+                "power",
+                datetime(2026, 9, 5, tzinfo=timezone.utc),
+                datetime(2026, 9, 6, tzinfo=timezone.utc),
+            )
+
+        self.assertTrue(warning.visible)
+        self.assertEqual(
+            warning.object,
+            "Power forecast data is not available.",
+        )
+        self.assertIn("power-forecast-unavailable", warning.css_classes)
+        stylesheet = Path(app.__file__).with_name("assets") / "dashboard.css"
+        css = stylesheet.read_text(encoding="utf-8")
+        rule = css.split(".power-forecast-unavailable {", 1)[1].split("}", 1)[0]
+        self.assertIn("color:", rule)
+        self.assertIn("background:", rule)
+        self.assertIn("border:", rule)
+        self.assertNotIn("display: none", rule)
+        self.assertNotIn("visibility: hidden", rule)
+        self.assertNotIn("opacity: 0", rule)
+
+    def test_archived_decision_uses_96_hour_cl61_count_in_summary(self) -> None:
+        record = {
+            "decision_horizon_hours": 96,
+            # Legacy archives can contain a full safety-tail count here.
+            "collection_hours": 55.0,
+            "instrument_hours": {"CL61": 46.0, "Radar": 49.0, "HATPRO": 55.0},
+            "minimum_p10_soc": 40.0,
+            "issued_at_utc": "2026-09-05T12:00:00Z",
+            "recommended_mode_windows": [],
+            "verification": {"status": "awaiting_measurements"},
+        }
+        with TemporaryDirectory() as tmpdir:
+            archive = Path(tmpdir) / "recommendations.json"
+            archive.write_text(
+                json.dumps({"recommendations": [record]}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                app,
+                "_power_operating_recommendations_path",
+                return_value=archive,
+            ):
+                view = app._operating_decision_audit_view()
+
+        markup = view.objects[0].object
+        label = (
+            "<div class='operating-plan-metric__label'>"
+            "Planned CL61 collection (decision window)</div>"
+        )
+        value = "<div class='operating-plan-metric__value'>46 h</div>"
+        self.assertIn(label + value, markup)
+        self.assertNotIn(label + "<div class='operating-plan-metric__value'>55 h</div>", markup)
 
     def test_desktop_shell_has_full_named_tabs(self) -> None:
         labels = [label for label, _slug, _panel in app.DESKTOP_TAB_SPECS]
