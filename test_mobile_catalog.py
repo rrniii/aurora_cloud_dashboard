@@ -1041,6 +1041,11 @@ class MobileCatalogTests(unittest.TestCase):
         )
         self.assertIn("not a recommendation", panel["explanation"])
         self.assertEqual(panel["info"]["title"], "No Feasible CL61 Schedule")
+        self.assertTrue(traces["OperatingCL61OptimizedCL61On"]["step"])
+        self.assertEqual(
+            traces["OperatingCL61OptimizedCL61On"]["stepAlignment"],
+            "intervalEnd",
+        )
 
     def test_priority_schedule_exposes_additive_sum_and_three_instrument_traces(self) -> None:
         import numpy as np
@@ -1174,6 +1179,12 @@ class MobileCatalogTests(unittest.TestCase):
         system_central = next(
             trace for trace in system["traces"] if trace["id"] == "SystemAsIsDecisionSOCP50"
         )
+        system_p10 = next(
+            trace for trace in system["traces"] if trace["id"] == "SystemAsIsDecisionSOCP10"
+        )
+        system_p90 = next(
+            trace for trace in system["traces"] if trace["id"] == "SystemAsIsDecisionSOCP90"
+        )
         scenario_current = next(
             trace for trace in scenarios["traces"] if trace["id"] == "OperatingCurrentSOCP50"
         )
@@ -1183,6 +1194,11 @@ class MobileCatalogTests(unittest.TestCase):
             if trace["id"] == "SystemAsIsDecisionBelow40Probability"
         )
         self.assertEqual(system_central["points"], scenario_current["points"])
+        self.assertNotEqual(system_p10["color"], system_p90["color"])
+        self.assertNotEqual(
+            system_p10["dash"] or "solid",
+            system_p90["dash"] or "solid",
+        )
         self.assertEqual(probability["unit"], "%")
         self.assertEqual(
             near_term_central["points"],

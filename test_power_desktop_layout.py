@@ -7,6 +7,7 @@ import pandas as pd
 import xarray as xr
 
 from grouped_timeseries import (
+    POWER_PANEL_TIME_GROUP_BY_KEY,
     PLOTLY_SUMMARY_POWER_MAX_HEIGHT,
     PLOTLY_SUMMARY_POWER_PANEL_GAP,
     PLOTLY_SUMMARY_POWER_PANEL_HEIGHT,
@@ -105,8 +106,6 @@ def test_soc_hindcast_labels_explain_forecast_issue_time() -> None:
 
 
 def test_every_power_forecast_panel_has_shared_implementation_info() -> None:
-    from grouped_timeseries import POWER_PANEL_TIME_GROUP_BY_KEY
-
     forecast_groups = {"forecast_24h", "forecast_96h", "verification"}
     panels = [
         panel
@@ -120,6 +119,95 @@ def test_every_power_forecast_panel_has_shared_implementation_info() -> None:
         assert info["title"]
         assert info["implementation"]
         assert info["metrics"]
+
+
+def test_every_96_hour_power_panel_clips_its_rendered_traces_to_96_hours() -> None:
+    anchor = pd.Timestamp("2026-09-06T00:00:00")
+    times = pd.date_range(anchor, anchor + pd.Timedelta(hours=240), freq="1h")
+    fields: dict[str, tuple[tuple[str], np.ndarray]] = {}
+    for panel in SUMMARY_LAYOUTS["power"]:
+        if POWER_PANEL_TIME_GROUP_BY_KEY.get(panel.key) != "forecast_96h":
+            continue
+        for trace in panel.traces:
+            if trace.var.endswith("Probability"):
+                values = np.linspace(0.0, 1.0, len(times))
+            elif trace.var.endswith("ActiveCount"):
+                values = np.ones(len(times))
+            elif trace.var.endswith("On") or trace.var.endswith("ModeCode"):
+                values = np.zeros(len(times))
+            else:
+                values = np.linspace(80.0, 60.0, len(times))
+            fields[trace.var] = (("time",), values)
+    dataset = xr.Dataset(
+        fields,
+        coords={"time": times},
+        attrs={
+            "forecast_initial_soc_time": anchor.isoformat(),
+            "operating_initial_soc_time": anchor.isoformat(),
+            "operating_decision_horizon_hours": "96",
+        },
+    )
+
+    figure = build_summary_plotly(
+        dataset,
+        "power",
+        panel_groups={"forecast_96h"},
+    )
+
+    expected_end = anchor + pd.Timedelta(hours=96)
+    assert figure.data
+    for trace in figure.data:
+        trace_times = pd.DatetimeIndex(pd.to_datetime(trace.x))
+        assert trace_times.min() >= anchor, trace.name
+        assert trace_times.max() <= expected_end, trace.name
+    for index in range(1, 5):
+        axis = getattr(figure.layout, "xaxis" if index == 1 else f"xaxis{index}")
+        assert pd.Timestamp(axis.range[0]) == anchor
+        assert pd.Timestamp(axis.range[1]) == expected_end
+
+
+def test_system_soc_quantiles_have_distinct_accessible_trace_styles() -> None:
+    panel = next(
+        panel
+        for panel in SUMMARY_LAYOUTS["power"]
+        if panel.key == "soc_ecmwf_forecast"
+    )
+    traces = {trace.var: trace for trace in panel.traces}
+    p10 = traces["SystemAsIsDecisionSOCP10"]
+    p50 = traces["SystemAsIsDecisionSOCP50"]
+    p90 = traces["SystemAsIsDecisionSOCP90"]
+
+    assert p10.color != p90.color
+    assert (p10.dash or "solid") != (p90.dash or "solid")
+    assert p50.line_width > max(p10.line_width, p90.line_width)
+    assert len(
+        {
+            (p10.color, p10.dash or "solid"),
+            (p50.color, p50.dash or "solid"),
+            (p90.color, p90.dash or "solid"),
+        }
+    ) == 3
+
+
+def test_operating_schedule_uses_interval_end_step_alignment() -> None:
+    anchor = pd.Timestamp("2026-09-06T00:00:00")
+    times = pd.date_range(anchor, periods=4, freq="1h")
+    dataset = xr.Dataset(
+        {
+            "OperatingCL61OptimizedActiveCount": (("time",), [0.0, 1.0, 1.0, 0.0]),
+            "OperatingCL61OptimizedCL61On": (("time",), [0.0, 1.0, 1.0, 0.0]),
+        },
+        coords={"time": times},
+    )
+
+    figure = build_summary_plotly(
+        dataset,
+        "power",
+        panel_groups={"forecast_96h"},
+    )
+
+    assert figure.data
+    assert all(trace.line.shape == "vh" for trace in figure.data)
 
 
 def test_operating_scenarios_start_with_current_state_reference() -> None:

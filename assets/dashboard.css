@@ -1452,6 +1452,15 @@ html, body, .bk {
     text-align: center;
     padding: 12px;
 }
+
+.power-forecast-unavailable {
+    color: #6b4d00;
+    background: #fff4cc;
+    border: 1px solid #d6a700;
+    border-radius: 8px;
+    font-weight: 700;
+    line-height: 1.4;
+}
 .mobile-figure {
     width: 100%;
     max-width: 100%;
