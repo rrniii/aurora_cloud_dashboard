@@ -655,6 +655,7 @@ def operations() -> dict[str, Any]:
             "delivery": archive_health.get("delivery", {}),
             "durability": archive_health.get("durability", {}),
             "verification": archive_health.get("verification", {}),
+            "recovery": archive_health.get("recovery", {}),
             "retention": archive_health.get("retention", {}),
         },
         "alerts": active_alerts,
@@ -864,6 +865,7 @@ def _archive_delivery(
             "lastCompleteAt": verification.get("last_complete_at"),
             "lastCertifiedRawAt": verification.get("last_certified_raw_at"),
         },
+        "recovery": archive_health.get("recovery", {}),
     }
 
 

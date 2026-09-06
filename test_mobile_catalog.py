@@ -309,6 +309,47 @@ class MobileCatalogTests(unittest.TestCase):
         self.assertEqual(response["archiveDelivery"]["strictAudit"]["state"], "running")
         self.assertEqual(response["archiveStatus"]["retention"]["paused"], True)
 
+    def test_recovery_progress_is_additive_and_alerts_follow_server_policy(self) -> None:
+        recovery = {
+            "enabled": True,
+            "state": "retry_wait",
+            "affected_jobs": ["products"],
+            "next_retry_at": "2026-09-06T06:30:00Z",
+            "jobs": {"products": {
+                "state": "retry_wait",
+                "progress": {"pages": 401},
+                "last_error": "JASMIN listing returned HTTP 504",
+                "observation_age_hours": 14,
+                "evidence_expires_at": "2026-09-07T04:00:00Z",
+            }},
+        }
+        for level in ("green", "amber", "red"):
+            with self.subTest(level=level):
+                archive = {
+                    "overall_level": level,
+                    "operator_status": {
+                        "level": level,
+                        "title": "Archive copies are healthy" if level == "green" else "Archive verification recovery needs attention",
+                        "detail": "Archive verification is retrying automatically.",
+                    },
+                    "recovery": recovery,
+                    "verification": {"state": "retry_wait", "completed_jobs": ["raw"], "total_jobs": 6},
+                }
+                def fixture(path):
+                    if path == mobile_catalog.archive_health_path():
+                        return archive
+                    return {}
+                with patch.object(mobile_catalog, "read_json_file", side_effect=fixture):
+                    response = mobile_catalog.operations()
+                self.assertEqual(response["archiveStatus"]["recovery"], recovery)
+                self.assertEqual(response["archiveDelivery"]["recovery"], recovery)
+                self.assertEqual(response["archiveDelivery"]["strictAudit"]["state"], "retry_wait")
+                alerts = [item for item in response["alerts"] if item["id"] == "archive:verification"]
+                self.assertEqual(len(alerts), 0 if level == "green" else 1)
+                if alerts:
+                    self.assertEqual(alerts[0]["level"], level)
+                    self.assertEqual(alerts[0]["detail"], archive["operator_status"]["detail"])
+
     def test_power_trace_sampling_is_bounded_and_preserves_extrema(self) -> None:
         import numpy as np
 
