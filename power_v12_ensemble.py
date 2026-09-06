@@ -31,7 +31,14 @@ from generate_power_soc_forecast import (
 from power_battery_model import BatteryModel
 from power_solar_model import PhysicalSolarConfig, build_physical_solar_forecast_frames
 from power_soc_thresholds import MINIMUM_OPERATIONAL_SOC_PCT
-from power_v12_hybrid import LEAD_BUCKETS, stable_json_digest, utc_now_iso
+from power_v12_hybrid import (
+    LEAD_BUCKETS,
+    PAIR_ARTIFACT_DIGEST_ALGORITHM,
+    immutable_artifact_record,
+    pair_artifacts_valid,
+    stable_json_digest,
+    utc_now_iso,
+)
 
 
 CANDIDATE_ENSEMBLE_VERSION = "memberwise_physical_pv_load_delta_v1"
@@ -453,6 +460,57 @@ def _candidate_ensemble_publication_signature(
     return "candidate-ensemble-publication-v1-" + stable_json_digest(payload)[:20]
 
 
+def _validate_member_soc_physics(
+    soc: np.ndarray,
+    solar: np.ndarray,
+    load: np.ndarray,
+    charge: np.ndarray,
+    discharge: np.ndarray,
+    parasitic_load_w: np.ndarray,
+) -> None:
+    """Validate every independently integrated member before publication."""
+
+    if soc.ndim != 2 or any(
+        values.shape != soc.shape for values in (solar, load, charge, discharge)
+    ):
+        raise ValueError("Candidate member physics arrays do not share member/time shape")
+    parasitic = np.asarray(parasitic_load_w, dtype=np.float64).reshape(-1)
+    if parasitic.shape != (soc.shape[0],) or not np.isfinite(parasitic).all() or np.any(parasitic < 0.0):
+        raise ValueError("Candidate member parasitic loads are invalid")
+    parasitic = parasitic[:, None]
+    if not np.isfinite(soc).all() or np.any(soc < -1.0e-5) or np.any(soc > 100.0 + 1.0e-5):
+        raise ValueError("Candidate member SOC is non-finite or outside physical bounds")
+    rises = np.diff(soc, axis=1) > 1.0e-5
+    falls = np.diff(soc, axis=1) < -1.0e-5
+    flow_known = np.isfinite(charge[:, 1:]) & np.isfinite(discharge[:, 1:])
+    net_charge = (
+        (flow_known & (charge[:, 1:] > discharge[:, 1:] + 1.0e-5))
+        | (
+            ~flow_known
+            & np.isfinite(solar[:, 1:])
+            & np.isfinite(load[:, 1:])
+            & (solar[:, 1:] > load[:, 1:] + parasitic + 1.0e-5)
+        )
+    )
+    net_discharge = (
+        (flow_known & (discharge[:, 1:] > charge[:, 1:] + 1.0e-5))
+        | (
+            ~flow_known
+            &
+            np.isfinite(solar[:, 1:])
+            & np.isfinite(load[:, 1:])
+            & (solar[:, 1:] + 1.0e-5 < load[:, 1:] + parasitic)
+        )
+    )
+    direction_known = flow_known | (
+        np.isfinite(solar[:, 1:]) & np.isfinite(load[:, 1:])
+    )
+    if np.any(rises & direction_known & ~net_charge):
+        raise ValueError("Candidate member SOC rises without net charging")
+    if np.any(falls & direction_known & ~net_discharge):
+        raise ValueError("Candidate member SOC falls without net discharging")
+
+
 def build_candidate_memberwise_ensemble(
     baseline: xr.Dataset,
     candidate: xr.Dataset,
@@ -483,6 +541,7 @@ def build_candidate_memberwise_ensemble(
     capacities: list[float] = []
     charge_efficiencies: list[float] = []
     discharge_efficiencies: list[float] = []
+    parasitic_loads: list[float] = []
     phase_source = baseline_ensemble.get("ForecastLoadPhaseCodeEnsemble")
 
     for member_index, _member in enumerate(members):
@@ -550,28 +609,50 @@ def build_candidate_memberwise_ensemble(
         capacities.append(model.usable_capacity_kwh)
         charge_efficiencies.append(model.charge_efficiency)
         discharge_efficiencies.append(model.discharge_efficiency)
+        parasitic_loads.append(model.parasitic_load_w)
 
     soc = np.asarray(soc_rows, dtype=np.float32)
+    solar_members = np.asarray(solar_rows, dtype=np.float32)
+    load_members = np.asarray(load_rows, dtype=np.float32)
+    discharge_members = np.asarray(discharge_rows, dtype=np.float32)
+    charge_members = np.asarray(charge_rows, dtype=np.float32)
+    _validate_member_soc_physics(
+        soc,
+        solar_members,
+        load_members,
+        charge_members,
+        discharge_members,
+        np.asarray(parasitic_loads, dtype=np.float64),
+    )
+    quantiles = np.nanquantile(soc, (0.10, 0.50, 0.90), axis=0).astype(np.float32)
+    if (
+        not np.isfinite(quantiles).all()
+        or np.any(quantiles < -1.0e-5)
+        or np.any(quantiles > 100.0 + 1.0e-5)
+        or np.any(quantiles[0] > quantiles[1] + 1.0e-5)
+        or np.any(quantiles[1] > quantiles[2] + 1.0e-5)
+    ):
+        raise ValueError("Candidate SOC quantiles violate bounds or ordering")
     output = xr.Dataset(
         {
             "BatterySOCForecastEnsemble": (("member", "time"), soc),
             "ECMWFSolarIrradianceEnsemble": (
                 ("member", "time"), np.asarray(irradiance_rows, dtype=np.float32)
             ),
-            "ForecastSolarWattsEnsemble": (("member", "time"), np.asarray(solar_rows, dtype=np.float32)),
+            "ForecastSolarWattsEnsemble": (("member", "time"), solar_members),
             "ForecastPVAvailableWattsEnsemble": (("member", "time"), np.asarray(available_rows, dtype=np.float32)),
             "ForecastPVDeliveredWattsEnsemble": (("member", "time"), np.asarray(delivered_rows, dtype=np.float32)),
             "ForecastPVCurtailedWattsEnsemble": (("member", "time"), np.asarray(curtailed_rows, dtype=np.float32)),
             "ForecastBatteryChargeInputWattsEnsemble": (("member", "time"), np.asarray(charge_rows, dtype=np.float32)),
-            "ForecastBatteryDischargeOutputWattsEnsemble": (("member", "time"), np.asarray(discharge_rows, dtype=np.float32)),
-            "ForecastLoadWattsEnsemble": (("member", "time"), np.asarray(load_rows, dtype=np.float32)),
+            "ForecastBatteryDischargeOutputWattsEnsemble": (("member", "time"), discharge_members),
+            "ForecastLoadWattsEnsemble": (("member", "time"), load_members),
             "ForecastLoadPhaseCodeEnsemble": (("member", "time"), np.asarray(phase_rows, dtype=np.int8)),
             "BatteryUsableCapacityKWhEnsemble": (("member",), np.asarray(capacities, dtype=np.float32)),
             "BatteryChargeEfficiencyEnsemble": (("member",), np.asarray(charge_efficiencies, dtype=np.float32)),
             "BatteryDischargeEfficiencyEnsemble": (("member",), np.asarray(discharge_efficiencies, dtype=np.float32)),
-            "BatterySOCForecastP10": (("time",), np.nanquantile(soc, 0.10, axis=0).astype(np.float32)),
-            "BatterySOCForecastP50": (("time",), np.nanquantile(soc, 0.50, axis=0).astype(np.float32)),
-            "BatterySOCForecastP90": (("time",), np.nanquantile(soc, 0.90, axis=0).astype(np.float32)),
+            "BatterySOCForecastP10": (("time",), quantiles[0]),
+            "BatterySOCForecastP50": (("time",), quantiles[1]),
+            "BatterySOCForecastP90": (("time",), quantiles[2]),
             "BatterySOCForecastMinimum": (("time",), np.nanmin(soc, axis=0).astype(np.float32)),
             "BatterySOCForecastMaximum": (("time",), np.nanmax(soc, axis=0).astype(np.float32)),
         },
@@ -609,6 +690,7 @@ def build_candidate_memberwise_ensemble(
                 else "read-only ECMWF site members with legacy solar trace and bounded candidate load residual"
             ),
             "generated_at_utc": utc_now_iso(),
+            "soc_physical_consistency_status": "passed_member_bounds_net_discharge_and_quantile_order",
         },
     )
     output = apply_operational_soc_threshold(output)
@@ -688,20 +770,41 @@ def write_immutable_ensemble_pair_bundle(
         "candidate_snapshot": "candidate_ensemble.zarr",
         **{str(key): value for key, value in manifest_extra.items()},
     }
+    required_artifacts = {
+        "baseline": "baseline_ensemble.zarr",
+        "candidate": "candidate_ensemble.zarr",
+    }
     if bundle.exists():
         try:
             existing = json.loads((bundle / "pair_manifest.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Existing ensemble pair bundle is invalid: {bundle}") from exc
-        if existing != manifest:
+        if any(existing.get(key) != value for key, value in manifest.items()):
             raise RuntimeError(f"Existing immutable ensemble pair bundle does not match: {bundle}")
+        if not pair_artifacts_valid(existing, bundle, required_artifacts):
+            raise RuntimeError(
+                f"Existing immutable ensemble pair bundle failed content verification: {bundle}"
+            )
         return bundle
     family.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".ensemble-pair-staging-", dir=family) as temporary:
         staging = Path(temporary)
         _atomic_write_zarr(baseline_ensemble, staging / "baseline_ensemble.zarr")
         _atomic_write_zarr(candidate_ensemble, staging / "candidate_ensemble.zarr")
-        _write_state(staging / "pair_manifest.json", manifest)
+        completed_manifest = {
+            **manifest,
+            "artifact_digest_algorithm": PAIR_ARTIFACT_DIGEST_ALGORITHM,
+            "artifact_checksums": {
+                logical_name: immutable_artifact_record(
+                    staging / relative_path,
+                    relative_path=relative_path,
+                )
+                for logical_name, relative_path in required_artifacts.items()
+            },
+        }
+        _write_state(staging / "pair_manifest.json", completed_manifest)
+        if not pair_artifacts_valid(completed_manifest, staging, required_artifacts):
+            raise RuntimeError("Staged immutable ensemble pair failed content verification")
         staging.replace(bundle)
     return bundle
 
@@ -723,9 +826,14 @@ def completed_ensemble_pair_bundles(root: Path) -> list[tuple[dict[str, object],
                 continue
             if manifest.get("pair_status") != "complete":
                 continue
-            if not (bundle / "baseline_ensemble.zarr").exists() or not (
-                bundle / "candidate_ensemble.zarr"
-            ).exists():
+            if not pair_artifacts_valid(
+                manifest,
+                bundle,
+                {
+                    "baseline": "baseline_ensemble.zarr",
+                    "candidate": "candidate_ensemble.zarr",
+                },
+            ):
                 continue
             bundles.append((manifest, bundle))
     return bundles
@@ -963,6 +1071,33 @@ def build_campaign_ensemble_evidence(
             },
         )
     assert member_values is not None
+    # Preserve every issue-time pair for audit/operational diagnostics, while
+    # marking exactly one latest row per source cycle and valid time for
+    # independent campaign evidence and promotion.
+    order = sorted(
+        range(len(records)),
+        key=lambda index: (
+            np.datetime64(records[index]["IssueTime"]),
+            np.datetime64(records[index]["ValidTime"]),
+            str(records[index]["EnsembleEvaluationPairID"]),
+        ),
+    )
+    records = [records[index] for index in order]
+    candidate_rows = [candidate_rows[index] for index in order]
+    baseline_rows = [baseline_rows[index] for index in order]
+    selected_by_cycle_valid: dict[tuple[str, int], int] = {}
+    for index, record in enumerate(records):
+        source_cycle = str(record.get("SourceCycleSetID", "")).strip()
+        if not source_cycle:
+            source_cycle = "issue:" + pd.Timestamp(record["IssueTime"]).isoformat()
+            record["SourceCycleSetID"] = source_cycle
+        valid_ns = int(np.datetime64(record["ValidTime"], "ns").astype(np.int64))
+        selected_by_cycle_valid[(source_cycle, valid_ns)] = index
+    selected_indices = set(selected_by_cycle_valid.values())
+    duplicate_cycle_valid_rows = len(records) - len(selected_indices)
+    for index, record in enumerate(records):
+        record["IndependentEvaluationSample"] = index in selected_indices
+        record["SOCAnchorTime"] = record["IssueTime"]
     scalar_vars: dict[str, tuple[tuple[str], np.ndarray]] = {}
     for name, values in {name: [record[name] for record in records] for name in records[0]}.items():
         first = values[0]
@@ -991,6 +1126,8 @@ def build_campaign_ensemble_evidence(
             "evidence_status": "complete_ensemble_pair_bundles_materialised",
             "evaluation_contract": json.dumps(dict(evaluation_contract or {}), sort_keys=True),
             "incompatible_pair_count": int(incompatible),
+            "duplicate_cycle_valid_rows_discarded": 0,
+            "duplicate_cycle_valid_rows_retained": int(duplicate_cycle_valid_rows),
             "reserve_threshold_soc_pct": f"{MINIMUM_OPERATIONAL_SOC_PCT:g}",
         },
     )
@@ -1018,6 +1155,11 @@ def _ensemble_metric_summary(evidence: xr.Dataset, mask: np.ndarray) -> dict[str
         values[valid] for values in (observations, anchors, candidate, baseline)
     )
     issue_values = pd.DatetimeIndex(evidence["IssueTime"].values)[selected][valid]
+    source_cycles = (
+        np.asarray(evidence["SourceCycleSetID"].values, dtype=str)[selected][valid]
+        if "SourceCycleSetID" in evidence
+        else np.asarray([], dtype=str)
+    )
     if len(observations) == 0:
         return {"status": "insufficient_evidence", "samples": 0, "cycles": 0, "utc_days": 0}
     candidate_crps = np.asarray(
@@ -1043,7 +1185,12 @@ def _ensemble_metric_summary(evidence: xr.Dataset, mask: np.ndarray) -> dict[str
     candidate_brier = np.square(candidate_probability - outcomes)
     baseline_brier = np.square(baseline_probability - outcomes)
     persistence_brier = np.square(persistence_probability - outcomes)
-    cycles = int(issue_values.nunique())
+    usable_cycles = [
+        value.strip()
+        for value in source_cycles
+        if value.strip() and value.strip().lower() not in {"nan", "none"}
+    ]
+    cycles = len(set(usable_cycles)) if usable_cycles else int(issue_values.nunique())
     days = int(issue_values.floor("D").nunique())
     events = int(np.count_nonzero(outcomes))
     summary: dict[str, object] = {
@@ -1133,7 +1280,11 @@ def campaign_ensemble_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
             },
         }
 
-    all_rows = np.ones(len(leads), dtype=bool)
+    all_rows = (
+        np.asarray(evidence["IndependentEvaluationSample"].values, dtype=bool)
+        if "IndependentEvaluationSample" in evidence
+        else np.ones(len(leads), dtype=bool)
+    )
     return {
         "generated_at_utc": utc_now_iso(),
         "campaign_evidence": surface(all_rows),

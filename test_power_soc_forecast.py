@@ -12,14 +12,17 @@ import xarray as xr
 
 from generate_power_soc_forecast import (
     _apply_soc_bias_corrections,
+    _active_forecast_contract_id,
     _atomic_write_archive,
     _extend_irradiance_with_diurnal_persistence,
+    _filter_active_forecast_contract,
     _load_mode_signature,
     _mode_learning_status,
     _pdu_active_kits,
     _repair_dc_only_registry,
     _resolve_load_mode,
     append_forecast_archive,
+    adaptive_calibration_state_id,
     build_forecast_dataset,
     build_forecast_skill_dataset,
     build_historical_load_forecast,
@@ -28,17 +31,24 @@ from generate_power_soc_forecast import (
     evaluate_forecast_archive,
     evaluate_independent_forecast_archive,
     forecast_publication_signature,
+    legacy_solar_model_contract_id,
     resolve_ecmwf_cycle_hour,
     solar_calibration_contract_id,
     solar_irradiance_from_ssrd,
     validate_power_input_freshness,
+    validate_soc_physical_consistency,
+    write_immutable_issue_snapshot,
+    ISSUE_SNAPSHOT_DIGEST_ALGORITHM,
+    ISSUE_SNAPSHOT_DIGEST_MARKER,
 )
 from generate_power_soc_ensemble import (
     _ensemble_refresh_reasons,
+    _power_at_or_before_cutoff,
     append_ensemble_archive,
     apply_operational_soc_threshold,
     build_ensemble_dataset,
     build_ensemble_skill_dataset,
+    generate as generate_ensemble_forecast,
 )
 from grouped_timeseries import (
     PDU_WATT_FIELDS,
@@ -132,6 +142,42 @@ class PowerSocForecastTests(unittest.TestCase):
 
         self.assertEqual(written["LoadMode"].values.tolist(), ["dc_only", "109"])
 
+    def test_issue_snapshot_is_idempotent_and_rejects_conflicting_content(self) -> None:
+        path = Path(self._tmp.name) / "issues" / "cycle" / "forecast.zarr"
+        issue = xr.Dataset(
+            {"BatterySOCForecast": (("time",), [70.0])},
+            coords={"time": [np.datetime64("2026-07-25T00:00:00")]},
+            attrs={
+                "forecast_verification_eligible": "true",
+                "forecast_refresh_kind": "ecmwf_cycle",
+                "publication_signature": "signature-one",
+            },
+        )
+
+        self.assertEqual(write_immutable_issue_snapshot(issue, path), path)
+        self.assertEqual(write_immutable_issue_snapshot(issue, path), path)
+        marker = json.loads(
+            (path / ISSUE_SNAPSHOT_DIGEST_MARKER).read_text(encoding="utf-8")
+        )
+        self.assertEqual(marker["digestAlgorithm"], ISSUE_SNAPSHOT_DIGEST_ALGORITHM)
+        self.assertRegex(marker["contentDigest"], r"^sha256:[0-9a-f]{64}$")
+        same_signature_conflict = issue.copy(deep=True)
+        same_signature_conflict["BatterySOCForecast"][:] = 71.0
+        with self.assertRaisesRegex(ValueError, "different forecast"):
+            write_immutable_issue_snapshot(same_signature_conflict, path)
+        conflicting = issue.copy(deep=True)
+        conflicting.attrs["publication_signature"] = "signature-two"
+        with self.assertRaisesRegex(ValueError, "different forecast"):
+            write_immutable_issue_snapshot(conflicting, path)
+        persisted_file = next(
+            candidate
+            for candidate in path.rglob("*")
+            if candidate.is_file() and candidate.name != ISSUE_SNAPSHOT_DIGEST_MARKER
+        )
+        persisted_file.write_bytes(persisted_file.read_bytes() + b"corrupt")
+        with self.assertRaisesRegex(ValueError, "content digest"):
+            write_immutable_issue_snapshot(issue, path)
+
     def test_ssrd_accumulation_converts_to_irradiance(self) -> None:
         times = pd.date_range("2026-07-10T00:00:00", periods=4, freq="3h")
         ds = xr.Dataset(
@@ -205,7 +251,14 @@ class PowerSocForecastTests(unittest.TestCase):
     def test_soc_bias_correction_preserves_actual_initial_anchor(self) -> None:
         issue = pd.Timestamp("2026-07-16T06:00:00")
         times = pd.DatetimeIndex([issue, issue + pd.Timedelta(hours=3), issue + pd.Timedelta(hours=6)])
-        forecast = pd.DataFrame({"BatterySOCForecast": [63.0, 62.0, 61.0]}, index=times)
+        forecast = pd.DataFrame(
+            {
+                "BatterySOCForecast": [63.0, 62.0, 61.0],
+                "ForecastSolarWatts": [0.0, 0.0, 0.0],
+                "ForecastLoadWatts": [100.0, 100.0, 100.0],
+            },
+            index=times,
+        )
 
         corrected = _apply_soc_bias_corrections(
             forecast,
@@ -214,8 +267,115 @@ class PowerSocForecastTests(unittest.TestCase):
         )
 
         self.assertEqual(float(corrected["BatterySOCForecast"].iloc[0]), 63.0)
-        self.assertEqual(float(corrected["BatterySOCForecast"].iloc[1]), 67.0)
-        self.assertEqual(float(corrected["BatterySOCForecast"].iloc[2]), 59.0)
+        # The residual is continuous from the observed anchor and cannot
+        # manufacture an SOC rise while the physical path is discharging.
+        self.assertEqual(float(corrected["BatterySOCForecast"].iloc[1]), 63.0)
+        self.assertEqual(float(corrected["BatterySOCForecast"].iloc[2]), 63.0)
+        self.assertEqual(float(corrected["ForecastSOCBiasCorrectionPctPoints"].iloc[0]), 0.0)
+        self.assertTrue(np.all(np.diff(corrected["BatterySOCForecast"].values) <= 0.0))
+
+    def test_soc_bias_correction_is_continuous_across_lead_bucket_boundaries(self) -> None:
+        issue = pd.Timestamp("2026-07-16T00:00:00")
+        times = pd.date_range(issue, periods=10, freq="3h")
+        # A negative residual may attenuate charging continuously, but cannot
+        # reverse it or create a bucket-boundary jump.
+        forecast = pd.DataFrame(
+            {
+                "BatterySOCForecast": np.linspace(50.0, 59.0, len(times)),
+                "ForecastSolarWatts": np.full(len(times), 500.0),
+                "ForecastLoadWatts": np.full(len(times), 100.0),
+            },
+            index=times,
+        )
+
+        corrected = _apply_soc_bias_corrections(
+            forecast,
+            {"0_6h": -2.0, "6_24h": -4.0, "24_48h": -5.0},
+            issue_time=issue,
+        )
+
+        residual = corrected["ForecastSOCBiasCorrectionPctPoints"].to_numpy()
+        self.assertAlmostEqual(float(residual[0]), 0.0)
+        self.assertAlmostEqual(float(residual[2]), -2.0)
+        self.assertAlmostEqual(float(residual[8]), -4.0)
+        # No bucket boundary is represented by an instantaneous same-time jump.
+        self.assertLessEqual(float(np.max(np.abs(np.diff(residual)))), 1.0)
+        self.assertTrue(np.all(np.diff(corrected["BatterySOCForecast"].values) >= 0.0))
+        self.assertTrue(
+            np.all(
+                np.diff(corrected["BatterySOCForecast"].values)
+                <= np.diff(forecast["BatterySOCForecast"].values) + 1.0e-9
+            )
+        )
+
+    def test_soc_residual_preserves_zero_charge_and_discharge_energy_directions(self) -> None:
+        issue = pd.Timestamp("2026-07-16T00:00:00")
+        times = pd.date_range(issue, periods=3, freq="3h")
+
+        def corrected(raw, charge, discharge, correction):
+            frame = pd.DataFrame(
+                {
+                    "BatterySOCForecast": raw,
+                    "ForecastBatteryChargeInputWatts": charge,
+                    "ForecastBatteryDischargeOutputWatts": discharge,
+                    "ForecastSolarWatts": np.zeros(3),
+                    "ForecastLoadWatts": np.zeros(3),
+                },
+                index=times,
+            )
+            return frame, _apply_soc_bias_corrections(
+                frame, {"0_6h": correction}, issue_time=issue
+            )
+
+        physical, zero_flow = corrected([50.0, 50.0, 50.0], [0.0] * 3, [0.0] * 3, 5.0)
+        np.testing.assert_allclose(zero_flow["BatterySOCForecast"], physical["BatterySOCForecast"])
+
+        physical, charging = corrected(
+            [50.0, 52.0, 54.0], [0.0, 200.0, 200.0], [0.0] * 3, -3.0
+        )
+        self.assertTrue(np.all(np.diff(charging["BatterySOCForecast"]) >= 0.0))
+        self.assertTrue(
+            np.all(np.diff(charging["BatterySOCForecast"]) <= np.diff(physical["BatterySOCForecast"]))
+        )
+
+        physical, discharging = corrected(
+            [50.0, 48.0, 46.0], [0.0] * 3, [0.0, 200.0, 200.0], 3.0
+        )
+        self.assertTrue(np.all(np.diff(discharging["BatterySOCForecast"]) <= 0.0))
+        self.assertTrue(
+            np.all(
+                np.abs(np.diff(discharging["BatterySOCForecast"]))
+                <= np.abs(np.diff(physical["BatterySOCForecast"]))
+            )
+        )
+        validate_soc_physical_consistency(charging)
+        validate_soc_physical_consistency(discharging)
+
+    def test_soc_validator_uses_net_battery_flow_when_charge_and_discharge_coexist(self) -> None:
+        times = pd.date_range("2026-07-16T00:00:00", periods=2, freq="1h")
+        forecast = pd.DataFrame(
+            {
+                "BatterySOCForecast": [50.0, 51.0],
+                # Aggregated intervals can contain both flows; the net flow is
+                # charging even though discharge is non-zero and solar<load.
+                "ForecastBatteryChargeInputWatts": [0.0, 200.0],
+                "ForecastBatteryDischargeOutputWatts": [0.0, 100.0],
+                "ForecastSolarWatts": [0.0, 0.0],
+                "ForecastLoadWatts": [100.0, 100.0],
+            },
+            index=times,
+        )
+
+        validate_soc_physical_consistency(forecast)
+
+        forecast.loc[times[-1], "ForecastBatteryChargeInputWatts"] = 50.0
+        with self.assertRaisesRegex(ValueError, "rises without a net-charging"):
+            validate_soc_physical_consistency(forecast)
+
+        forecast["BatterySOCForecast"] = [50.0, 49.0]
+        forecast.loc[times[-1], "ForecastBatteryChargeInputWatts"] = 200.0
+        with self.assertRaisesRegex(ValueError, "falls without a net-discharging"):
+            validate_soc_physical_consistency(forecast)
 
     def test_24h_forecast_panel_is_future_model_output_not_observed_soc(self) -> None:
         panel = next(panel for panel in SUMMARY_LAYOUTS["power"] if panel.key == "soc_24h_forecast")
@@ -390,6 +550,178 @@ class PowerSocForecastTests(unittest.TestCase):
 
         self.assertEqual(first, reordered)
         self.assertNotEqual(first, solar_calibration_contract_id(2.1, {"0_6h": 1.0, "6_24h": 0.9}))
+
+    def test_adaptive_calibration_does_not_fragment_the_solar_model_contract(self) -> None:
+        model_contract = legacy_solar_model_contract_id()
+        first = adaptive_calibration_state_id(
+            {
+                "solar_calibration_contract_id": solar_calibration_contract_id(
+                    2.0, {"0_6h": 1.0}
+                ),
+                "load_bias_correction_w": "0",
+            }
+        )
+        second = adaptive_calibration_state_id(
+            {
+                "solar_calibration_contract_id": solar_calibration_contract_id(
+                    2.2, {"0_6h": 0.9}
+                ),
+                "load_bias_correction_w": "0",
+            }
+        )
+
+        self.assertEqual(model_contract, legacy_solar_model_contract_id())
+        self.assertNotEqual(first, second)
+
+    def test_adaptive_calibration_identity_tracks_load_state_not_model_contract(self) -> None:
+        base = {
+            "solar_calibration_contract_id": "solar-state-one",
+            "load_residual_model_contract_id": "load-residual-contract-one",
+            "load_residual_state_digest": "sha256:state-one",
+            "load_mode_signature": "DC-Only+CL61",
+            "load_state_dynamics_signature": "phase-profile-one",
+            "load_mode_registry": '{"DC-Only":{"learned_level_w":220}}',
+            "forecast_load_w": "315",
+            "forecast_load_p10_w": "300",
+            "forecast_load_p50_w": "315",
+            "forecast_load_p90_w": "340",
+        }
+        first = adaptive_calibration_state_id(base)
+
+        changed = dict(base)
+        changed["load_residual_state_digest"] = "sha256:state-two"
+        self.assertNotEqual(first, adaptive_calibration_state_id(changed))
+
+        changed = dict(base)
+        changed["load_state_dynamics_signature"] = "phase-profile-two"
+        self.assertNotEqual(first, adaptive_calibration_state_id(changed))
+
+    def test_physical_soc_validation_accounts_for_battery_parasitic_load(self) -> None:
+        forecast = pd.DataFrame(
+            {
+                "BatterySOCForecast": [50.0, 49.9],
+                "ForecastSolarWatts": [100.0, 100.0],
+                "ForecastLoadWatts": [100.0, 100.0],
+            },
+            index=pd.date_range("2026-07-01", periods=2, freq="1h"),
+        )
+
+        validate_soc_physical_consistency(forecast, parasitic_load_w=25.0)
+        with self.assertRaisesRegex(ValueError, "falls without a net-discharging"):
+            validate_soc_physical_consistency(forecast, parasitic_load_w=0.0)
+
+    def test_first_nonempty_forecast_contract_excludes_blank_legacy_rows(self) -> None:
+        semantic_archive = {
+            "ForecastSystemVersion": ["", "system-v1"],
+            "FeatureSetVersion": ["", "features-v1"],
+            "FeatureSetDigest": ["", "digest-v1"],
+            "ForecastCodeRevision": ["", "revision-v1"],
+            "CandidateLane": ["", "baseline"],
+            "LocalFeatureContractID": ["", "local-v1"],
+            "BaselineControlContractID": ["", "control-v1"],
+            "BaselineControlSystemVersion": ["", "power-v10"],
+        }
+        archive = xr.Dataset(
+            {
+                "ForecastModelContractID": (("issue_time",), ["", "contract-v1"]),
+                **{
+                    name: (("issue_time",), values)
+                    for name, values in semantic_archive.items()
+                },
+            },
+            coords={"issue_time": pd.date_range("2026-07-01", periods=2, freq="1h")},
+        )
+        rows = pd.DataFrame(
+            {
+                "forecast_model_contract_id": ["", "contract-v1"],
+                "forecast_system_version": semantic_archive["ForecastSystemVersion"],
+                "feature_set_version": semantic_archive["FeatureSetVersion"],
+                "feature_set_digest": semantic_archive["FeatureSetDigest"],
+                "forecast_code_revision": semantic_archive["ForecastCodeRevision"],
+                "candidate_lane": semantic_archive["CandidateLane"],
+                "local_feature_contract_id": semantic_archive["LocalFeatureContractID"],
+                "baseline_control_contract_id": semantic_archive[
+                    "BaselineControlContractID"
+                ],
+                "baseline_control_system_version": semantic_archive[
+                    "BaselineControlSystemVersion"
+                ],
+                "value": [99.0, 1.0],
+            }
+        )
+
+        self.assertEqual(_active_forecast_contract_id(archive), "contract-v1")
+        filtered = _filter_active_forecast_contract(rows, archive)
+
+        self.assertEqual(filtered["value"].tolist(), [1.0])
+
+    def test_deterministic_evidence_filters_the_complete_semantic_identity(self) -> None:
+        issue = pd.Timestamp("2026-07-10T00:00:00")
+        semantic = {
+            "forecast_model_contract_id": "contract-v12",
+            "forecast_system_version": "power-v12",
+            "feature_set_version": "features-v4",
+            "forecast_code_revision": "revision-v12",
+            "candidate_lane": "D_physical_solar_load_residual",
+            "local_feature_contract_id": "local-v1",
+            "baseline_control_contract_id": "baseline-v10",
+            "baseline_control_system_version": "power-v10",
+            "forecast_refresh_kind": "ecmwf_cycle",
+            "forecast_verification_eligible": "true",
+            "independent_cycle": "true",
+            "load_model_version": "10",
+        }
+        old = xr.Dataset(
+            {"BatterySOCForecast": (("time",), [60.0, 10.0])},
+            coords={"time": [issue, issue + pd.Timedelta(hours=6)]},
+            attrs={
+                **semantic,
+                "initial_soc_time": issue.isoformat(),
+                "ecmwf_cycle_time": issue.isoformat(),
+                "source_cycle_set_id": "cycle-old",
+                "feature_set_digest": "digest-old",
+            },
+        )
+        new_issue = issue + pd.Timedelta(hours=3)
+        new = xr.Dataset(
+            {"BatterySOCForecast": (("time",), [60.0, 58.0])},
+            coords={"time": [new_issue, new_issue + pd.Timedelta(hours=6)]},
+            attrs={
+                **semantic,
+                "initial_soc_time": new_issue.isoformat(),
+                "ecmwf_cycle_time": new_issue.isoformat(),
+                "source_cycle_set_id": "cycle-new",
+                "feature_set_digest": "digest-new",
+            },
+        )
+        append_forecast_archive(old, self.tmp_archive_path)
+        archive = append_forecast_archive(new, self.tmp_archive_path)
+        frame = pd.DataFrame(
+            {"BatterySOC": [60.0, 60.0, 60.0, 58.0]},
+            index=[
+                issue,
+                new_issue,
+                issue + pd.Timedelta(hours=6),
+                new_issue + pd.Timedelta(hours=6),
+            ],
+        )
+        frame.index.name = "time"
+
+        metrics = evaluate_independent_forecast_archive(archive, frame)
+        hindcast = build_soc_hindcast_dataset(archive, frame.to_xarray(), retention_days=1)
+
+        self.assertAlmostEqual(float(metrics["soc_mae"]), 0.0)
+        self.assertEqual(int(metrics["soc_independent_cycles"]), 1)
+        self.assertEqual(hindcast.attrs["forecast_model_contract_id"], "contract-v12")
+        self.assertTrue(
+            np.isnan(
+                float(
+                    hindcast["BatterySOCHindcast_6h"].sel(
+                        time=(issue + pd.Timedelta(hours=6)).to_datetime64()
+                    )
+                )
+            )
+        )
 
     def test_load_scenarios_decline_with_higher_loads(self) -> None:
         power_times = pd.date_range("2026-07-09T00:00:00", periods=25, freq="1h")
@@ -945,6 +1277,52 @@ class PowerSocForecastTests(unittest.TestCase):
         self.assertAlmostEqual(float(independent["soc_mae_0_6h"]), 0.0)
         self.assertEqual(int(independent["soc_independent_cycles"]), 1)
 
+    def test_cached_reanchors_are_archived_but_not_adaptive_evidence(self) -> None:
+        cycle = pd.Timestamp("2026-07-10T00:00:00")
+        valid_time = cycle + pd.Timedelta(hours=3)
+        independent_issue = xr.Dataset(
+            {"BatterySOCForecast": (("time",), [60.0, 58.0])},
+            coords={"time": [cycle, valid_time]},
+            attrs={
+                "initial_soc_time": cycle.isoformat(),
+                "ecmwf_cycle_time": cycle.isoformat(),
+                "forecast_refresh_kind": "ecmwf_cycle",
+                "forecast_verification_eligible": "true",
+                "independent_cycle": "true",
+            },
+        )
+        cached_time = cycle + pd.Timedelta(minutes=15)
+        cached_issue = xr.Dataset(
+            {"BatterySOCForecast": (("time",), [60.0, 20.0])},
+            coords={"time": [cached_time, valid_time]},
+            attrs={
+                "initial_soc_time": cached_time.isoformat(),
+                "ecmwf_cycle_time": cycle.isoformat(),
+                "forecast_refresh_kind": "cached_reanchor",
+                "forecast_verification_eligible": "false",
+                "independent_cycle": "false",
+            },
+        )
+        append_forecast_archive(independent_issue, self.tmp_archive_path)
+        archive = append_forecast_archive(cached_issue, self.tmp_archive_path)
+        frame = pd.DataFrame(
+            {"BatterySOC": [60.0, 60.0, 58.0]},
+            index=pd.DatetimeIndex([cycle, cached_time, valid_time]),
+        )
+
+        metrics = evaluate_independent_forecast_archive(archive, frame)
+
+        self.assertEqual(
+            archive["ForecastRefreshKind"].values.tolist(),
+            ["ecmwf_cycle", "cached_reanchor"],
+        )
+        self.assertEqual(
+            archive["ForecastVerificationEligible"].values.tolist(),
+            [True, False],
+        )
+        self.assertAlmostEqual(float(metrics["soc_mae_0_6h"]), 0.0)
+        self.assertEqual(int(metrics["soc_independent_cycles"]), 1)
+
     def test_build_ensemble_starts_every_member_at_actual_soc(self) -> None:
         power_times = pd.date_range("2026-07-10T00:00:00", periods=49, freq="1h")
         power = xr.Dataset(
@@ -1008,6 +1386,123 @@ class PowerSocForecastTests(unittest.TestCase):
             ensemble.attrs["load_uncertainty"],
             "stationary exact-state load distribution independently paired with ECMWF solar members",
         )
+
+    def test_ensemble_generation_uses_exact_deterministic_power_cutoff(self) -> None:
+        root = Path(self._tmp.name)
+        power_path = root / "live_power.zarr"
+        deterministic_path = root / "deterministic.zarr"
+        solar_path = root / "ensemble.nc"
+        output_path = root / "ensemble.zarr"
+        archive_path = root / "ensemble_archive.zarr"
+        skill_path = root / "ensemble_skill.zarr"
+        cutoff = pd.Timestamp("2026-07-10T04:00:00")
+        power_times = pd.date_range("2026-07-10T00:00:00", periods=6, freq="1h")
+        xr.Dataset(
+            {
+                "BatterySOC": (("time",), [70.0, 69.0, 68.0, 67.0, 66.0, 12.0]),
+                "ACOutputWatts": (("time",), np.full(6, 100.0)),
+                "DCInverterWatts": (("time",), np.full(6, 20.0)),
+            },
+            coords={"time": power_times},
+        ).to_zarr(power_path, mode="w", consolidated=True)
+        xr.Dataset(
+            attrs={
+                "initial_soc_time": cutoff.isoformat(),
+                "initial_soc_pct": "66",
+                "solar_calibration_factor_w_per_wm2": "1",
+                "battery_capacity_kwh": "26",
+                "load_bias_correction_w": "0",
+                "forecast_load_p10_w": "110",
+                "forecast_load_p50_w": "120",
+                "forecast_load_p90_w": "130",
+                "load_state_contract": "finite_operating_state_v1",
+                "source_cycle_set_id": "deterministic-cycle-set",
+                "source_manifest_digest": f"sha256:{'a' * 64}",
+                "forecast_identity_id": "deterministic-forecast-identity",
+            }
+        ).to_zarr(deterministic_path, mode="w", consolidated=True)
+        solar_times = pd.date_range(cutoff, periods=3, freq="3h")
+        xr.Dataset(
+            {
+                "ssrd": (
+                    ("number", "time"),
+                    np.stack(
+                        [
+                            np.arange(3, dtype=float) * 3 * 3600 * irradiance
+                            for irradiance in (100.0, 200.0, 300.0)
+                        ]
+                    ),
+                )
+            },
+            coords={"number": [1, 2, 3], "time": solar_times},
+        ).to_netcdf(solar_path)
+
+        generate_ensemble_forecast(
+            power_zarr=power_path,
+            deterministic_zarr=deterministic_path,
+            output_zarr=output_path,
+            archive_zarr=archive_path,
+            skill_zarr=skill_path,
+            input_forecast=solar_path,
+            horizon_hours=6,
+            power_cutoff_time=cutoff.isoformat(),
+        )
+
+        with xr.open_zarr(output_path, chunks={}) as forecast:
+            ensemble_source_cycle_set_id = str(forecast.attrs["source_cycle_set_id"])
+            self.assertEqual(pd.Timestamp(forecast.attrs["initial_soc_time"]), cutoff)
+            self.assertEqual(float(forecast.attrs["initial_soc_pct"]), 66.0)
+            self.assertEqual(
+                pd.Timestamp(forecast.attrs["power_input_cutoff_time_utc"]), cutoff
+            )
+            self.assertTrue(
+                forecast.attrs["source_cycle_set_id"].startswith(
+                    "power-ensemble-source-set-v1-"
+                )
+            )
+            self.assertNotEqual(
+                forecast.attrs["source_cycle_set_id"], "deterministic-cycle-set"
+            )
+            self.assertEqual(
+                forecast.attrs["deterministic_source_cycle_set_id"],
+                "deterministic-cycle-set",
+            )
+            self.assertEqual(
+                forecast.attrs["deterministic_source_manifest_digest"],
+                f"sha256:{'a' * 64}",
+            )
+            self.assertRegex(
+                forecast.attrs["ensemble_site_forcing_sha256"], r"^sha256:[0-9a-f]{64}$"
+            )
+            self.assertRegex(
+                forecast.attrs["source_manifest_digest"], r"^sha256:[0-9a-f]{64}$"
+            )
+            self.assertNotEqual(
+                forecast.attrs["forecast_identity_id"],
+                "deterministic-forecast-identity",
+            )
+            np.testing.assert_allclose(
+                forecast["BatterySOCForecastEnsemble"].isel(time=0).values,
+                66.0,
+            )
+        with xr.open_zarr(archive_path, chunks={}) as archive:
+            self.assertEqual(
+                str(archive["SourceCycleSetID"].values[-1]),
+                ensemble_source_cycle_set_id,
+            )
+        with xr.open_zarr(skill_path, chunks={}) as skill:
+            self.assertLessEqual(pd.Timestamp(skill["time"].values[-1]), cutoff)
+
+    def test_ensemble_power_cutoff_fails_without_an_exact_soc_anchor(self) -> None:
+        power = xr.Dataset(
+            {"BatterySOC": (("time",), [70.0, 69.0])},
+            coords={"time": pd.date_range("2026-07-10T01:00:00", periods=2, freq="1h")},
+        )
+
+        with self.assertRaisesRegex(ValueError, "No APS power data exist"):
+            _power_at_or_before_cutoff(power, pd.Timestamp("2026-07-10T00:00:00"))
+        with self.assertRaisesRegex(ValueError, "exact ensemble cutoff"):
+            _power_at_or_before_cutoff(power, pd.Timestamp("2026-07-10T01:30:00"))
 
     def test_ensemble_load_members_span_one_stationary_state_distribution(self) -> None:
         power_times = pd.date_range("2026-07-10T00:00:00", periods=49, freq="1h")
@@ -1137,10 +1632,24 @@ class PowerSocForecastTests(unittest.TestCase):
             "load_state_uncertainty_source": "elapsed_time_exact_state_phase_distribution",
             "load_state_dynamics": '{"current_phase":"fan_low"}',
             "load_state_dynamics_signature": "phase-profile-a",
+            "forecast_identity_id": "deterministic-identity",
+            "source_cycle_set_id": "deterministic-source-set",
+            "source_manifest_digest": f"sha256:{'b' * 64}",
         }
         matching_attrs = dict(deterministic_attrs)
 
         self.assertEqual(_ensemble_refresh_reasons(matching_attrs, deterministic_attrs), [])
+
+        composite_attrs = {
+            **matching_attrs,
+            "forecast_identity_id": "ensemble-composite-identity",
+            "source_cycle_set_id": "ensemble-composite-source-set",
+            "source_manifest_digest": f"sha256:{'c' * 64}",
+            "deterministic_forecast_identity_id": "deterministic-identity",
+            "deterministic_source_cycle_set_id": "deterministic-source-set",
+            "deterministic_source_manifest_digest": f"sha256:{'b' * 64}",
+        }
+        self.assertEqual(_ensemble_refresh_reasons(composite_attrs, deterministic_attrs), [])
 
         stale_dynamics = dict(matching_attrs)
         stale_dynamics["load_state_dynamics_signature"] = "phase-profile-b"
@@ -1224,6 +1733,106 @@ class PowerSocForecastTests(unittest.TestCase):
         finite_coverage = skill["ForecastSOCIntervalCoverage80"].values
         finite_coverage = finite_coverage[np.isfinite(finite_coverage)]
         self.assertTrue(np.all((finite_coverage >= 0.0) & (finite_coverage <= 1.0)))
+
+    def test_ensemble_skill_filters_semantic_identity_and_cached_reanchors(self) -> None:
+        common_new_identity = {
+            "forecast_model_contract_id": "new-contract",
+            "forecast_system_version": "power-v12",
+            "feature_set_version": "features-v4",
+            "feature_set_digest": "feature-digest",
+            "forecast_code_revision": "revision-new",
+            "candidate_lane": "D_physical_solar_load_residual",
+            "local_feature_contract_id": "local-v1",
+            "baseline_control_contract_id": "baseline-v10",
+            "baseline_control_system_version": "power-v10",
+        }
+
+        def ensemble_issue(
+            issue: pd.Timestamp,
+            *,
+            target_soc: float,
+            contract: str,
+            source_cycle: str,
+            independent: bool,
+        ) -> xr.Dataset:
+            attrs = {
+                **common_new_identity,
+                "initial_soc_time": issue.isoformat(),
+                "ecmwf_cycle_time": issue.floor("3h").isoformat(),
+                "source_cycle_set_id": source_cycle,
+                "forecast_model_contract_id": contract,
+                "forecast_refresh_kind": "ecmwf_cycle" if independent else "cached_reanchor",
+                "forecast_verification_eligible": str(independent).lower(),
+                "independent_cycle": str(independent).lower(),
+            }
+            members = np.asarray(
+                [[50.0, target_soc], [50.0, target_soc]], dtype=np.float32
+            )
+            return xr.Dataset(
+                {"BatterySOCForecastEnsemble": (("member", "time"), members)},
+                coords={
+                    "member": [1, 2],
+                    "time": [issue.to_datetime64(), (issue + pd.Timedelta(hours=3)).to_datetime64()],
+                },
+                attrs=attrs,
+            )
+
+        archive = append_ensemble_archive(
+            ensemble_issue(
+                pd.Timestamp("2026-07-10T00:00:00"),
+                target_soc=10.0,
+                contract="old-contract",
+                source_cycle="old-cycle",
+                independent=True,
+            ),
+            self.tmp_ensemble_archive_path,
+        )
+        archive = append_ensemble_archive(
+            ensemble_issue(
+                pd.Timestamp("2026-07-10T01:00:00"),
+                target_soc=50.0,
+                contract="new-contract",
+                source_cycle="new-cycle",
+                independent=True,
+            ),
+            self.tmp_ensemble_archive_path,
+        )
+        archive = append_ensemble_archive(
+            ensemble_issue(
+                pd.Timestamp("2026-07-10T02:00:00"),
+                target_soc=5.0,
+                contract="new-contract",
+                source_cycle="new-cycle",
+                independent=False,
+            ),
+            self.tmp_ensemble_archive_path,
+        )
+        power_times = pd.date_range("2026-07-10T00:00:00", periods=21, freq="15min")
+        power = xr.Dataset(
+            {"BatterySOC": (("time",), np.full(len(power_times), 50.0))},
+            coords={"time": power_times},
+        )
+
+        skill = build_ensemble_skill_dataset(archive, power, retention_days=1)
+
+        self.assertEqual(
+            archive["ForecastVerificationEligible"].values.tolist(),
+            [True, True, False],
+        )
+        self.assertEqual(archive["IndependentCycle"].values.tolist(), [True, True, False])
+        self.assertEqual(archive["ForecastModelContractID"].values.tolist(), [
+            "old-contract",
+            "new-contract",
+            "new-contract",
+        ])
+        finite_crps = skill["ForecastSOCCRPS_0_6h"].values
+        finite_crps = finite_crps[np.isfinite(finite_crps)]
+        self.assertTrue(len(finite_crps))
+        np.testing.assert_allclose(finite_crps, 0.0)
+        finite_cycles = skill["ForecastSOCCRPSCycles_0_6h"].values
+        finite_cycles = finite_cycles[np.isfinite(finite_cycles)]
+        np.testing.assert_allclose(finite_cycles, 1.0)
+        self.assertEqual(skill.attrs["forecast_model_contract_id"], "new-contract")
 
     def test_ensemble_guidance_marks_immature_long_range_scores_not_verified(self) -> None:
         times = pd.date_range("2026-07-10T00:00:00", periods=2, freq="1h")

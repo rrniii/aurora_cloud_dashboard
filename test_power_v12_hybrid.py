@@ -19,22 +19,32 @@ from generate_power_soc_forecast import (
     apply_forecast_identity,
     generate,
 )
-from generate_power_soc_v12_candidate import run_candidate
+from generate_power_soc_v12_candidate import (
+    POWER_HISTORY_FIELDS,
+    _campaign_observation_start,
+    _embedded_site_irradiance,
+    run_candidate,
+)
 from power_issue_time_features import site_extract_sha256
 from power_load_dynamics import ControlledLoadProfile
 from power_solar_model import load_physical_solar_config
 from power_v12_ensemble import (
+    _validate_member_soc_physics,
     build_candidate_memberwise_ensemble,
     build_campaign_ensemble_evidence,
+    campaign_ensemble_score_surfaces,
     ensemble_evaluation_contract_from_forecast,
     ensemble_promotion_gate,
     write_immutable_ensemble_pair_bundle,
 )
 from power_v12_hybrid import (
+    PAIR_ARTIFACT_DIGEST_ALGORITHM,
+    _clearness_cloud_regime,
     build_campaign_evidence,
     campaign_score_surfaces,
     evaluation_contract_from_forecast,
     fit_bounded_load_residual,
+    immutable_artifact_record,
     promotion_gate_review,
 )
 
@@ -49,6 +59,28 @@ def _tree_digest(root: Path) -> str:
             digest.update(path.relative_to(root).as_posix().encode("utf-8"))
             digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def _write_integrity_pair_manifest(
+    bundle: Path,
+    payload: dict[str, object],
+    artifacts: dict[str, str],
+) -> None:
+    manifest = {
+        **payload,
+        "artifact_digest_algorithm": PAIR_ARTIFACT_DIGEST_ALGORITHM,
+        "artifact_checksums": {
+            logical_name: immutable_artifact_record(
+                bundle / relative_path,
+                relative_path=relative_path,
+            )
+            for logical_name, relative_path in artifacts.items()
+        },
+    }
+    (bundle / "pair_manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
 
 
 def _archive_with_load_history() -> xr.Dataset:
@@ -73,6 +105,79 @@ def _archive_with_load_history() -> xr.Dataset:
 
 
 class HybridCandidateTests(unittest.TestCase):
+    def test_candidate_history_retains_mpp_modes_for_physical_solar_evidence(self) -> None:
+        self.assertTrue(
+            {
+                "SolarMPPMode_East",
+                "SolarMPPMode_South",
+                "SolarMPPMode_West",
+            }.issubset(POWER_HISTORY_FIELDS)
+        )
+
+    def test_embedded_site_forcing_requires_exact_grid_and_source_provenance(self) -> None:
+        times = pd.date_range("2026-09-05T12:00:00", periods=3, freq="3h")
+        baseline = xr.Dataset(
+            {"ECMWFSolarIrradiance": (("time",), [np.nan, 120.0, 250.0])},
+            coords={"time": times},
+            attrs={
+                "initial_soc_time": times[0].isoformat(),
+                "ecmwf_cycle_time": "2026-09-05T00:00:00",
+                "source_cycle_set_id": "ecmwf:legacy:cycle-test",
+                "source_manifest_digest": f"sha256:{'a' * 64}",
+            },
+        )
+
+        selected, digest, provenance = _embedded_site_irradiance(baseline)
+        np.testing.assert_allclose(selected.values, [np.nan, 120.0, 250.0], equal_nan=True)
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(provenance["site_irradiance_sha256"], f"sha256:{digest}")
+        self.assertEqual(
+            provenance["source_manifest_digest"], baseline.attrs["source_manifest_digest"]
+        )
+
+        missing_field = baseline.drop_vars("ECMWFSolarIrradiance")
+        with self.assertRaisesRegex(ValueError, "lacks embedded"):
+            _embedded_site_irradiance(missing_field)
+        missing_provenance = baseline.copy(deep=True)
+        missing_provenance.attrs.pop("source_manifest_digest")
+        with self.assertRaisesRegex(ValueError, "source-manifest provenance"):
+            _embedded_site_irradiance(missing_provenance)
+        wrong_grid = baseline.assign_coords(time=[times[0], times[0], times[2]])
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            _embedded_site_irradiance(wrong_grid)
+
+    def test_campaign_observation_window_starts_at_first_candidate_issue(self) -> None:
+        issue = pd.Timestamp("2026-09-05T12:00:00")
+        training_start = issue - pd.Timedelta(days=21)
+        first_issue = issue - pd.Timedelta(days=35)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifests = root / "source_manifests"
+            manifests.mkdir()
+            (manifests / "sha256-one.json").write_text(
+                json.dumps({"initial_soc_time": first_issue.isoformat()}),
+                encoding="utf-8",
+            )
+            (manifests / "sha256-future.json").write_text(
+                json.dumps({"initial_soc_time": (issue + pd.Timedelta(days=1)).isoformat()}),
+                encoding="utf-8",
+            )
+
+            selected = _campaign_observation_start(
+                root,
+                issue_time=issue,
+                training_start=training_start,
+            )
+
+        self.assertEqual(selected, first_issue)
+
+    def test_cloud_regime_uses_daytime_clearness_index_and_fails_closed(self) -> None:
+        self.assertEqual(_clearness_cloud_regime(0.0, np.nan), "dark")
+        self.assertEqual(_clearness_cloud_regime(300.0, np.nan), "unknown")
+        self.assertEqual(_clearness_cloud_regime(300.0, 0.30), "cloudy")
+        self.assertEqual(_clearness_cloud_regime(300.0, 0.50), "transitional")
+        self.assertEqual(_clearness_cloud_regime(300.0, 0.70), "clear")
+
     def test_load_residual_cannot_erase_observed_dc_core_floor(self) -> None:
         times = pd.date_range("2026-06-01", periods=3, freq="1h")
         profile = ControlledLoadProfile(
@@ -156,6 +261,31 @@ class HybridCandidateTests(unittest.TestCase):
         self.assertTrue(fit.status.startswith("insufficient_issue_time_evidence"))
         self.assertTrue(np.allclose(fit.p50_correction_w.values, 0.0))
 
+    def test_load_residual_contract_is_stable_across_issue_operating_modes(self) -> None:
+        archive = _archive_with_load_history()
+        times = pd.date_range("2026-06-01", periods=5 * 24, freq="1h")
+        power = xr.Dataset(
+            {
+                "ACOutputWatts": (("time",), np.full(len(times), 200.0)),
+                "DCInverterWatts": (("time",), np.zeros(len(times))),
+            },
+            coords={"time": times},
+        )
+        common = {
+            "archive": archive,
+            "power": power,
+            "issue_time": "2026-06-04T00:00:00",
+            "forecast_times": pd.date_range("2026-06-04", periods=3, freq="3h"),
+            "control_forecast_model_contract_id": "v10",
+            "control_forecast_system_version": "v10-control",
+        }
+
+        dc_only = fit_bounded_load_residual(load_mode="DC-Only", **common)
+        cl61 = fit_bounded_load_residual(load_mode="CL61", **common)
+
+        self.assertEqual(dc_only.contract_id, cl61.contract_id)
+        self.assertNotEqual(dc_only.status, cl61.status)
+
     def test_v12_identity_round_trips_to_archive_rows(self) -> None:
         issue = pd.Timestamp("2026-06-21T12:00:00")
         forecast = xr.Dataset(
@@ -167,6 +297,8 @@ class HybridCandidateTests(unittest.TestCase):
                 "forecast_model_name": "candidate",
                 "forecast_model_version": "12",
                 "input_snapshot_id": "sha256:test",
+                "initial_soc_pct": "70",
+                "adaptive_calibration_state_id": "adaptive-state-test",
             },
         )
         apply_forecast_identity(
@@ -193,19 +325,49 @@ class HybridCandidateTests(unittest.TestCase):
         self.assertEqual(str(archived["CandidateLane"].values[0]), "D_hybrid")
         self.assertEqual(str(archived["LocalFeatureContractID"].values[0]), "issue-features-test")
         self.assertEqual(str(archived["BaselineControlContractID"].values[0]), "baseline-control")
+        self.assertEqual(
+            str(archived["AdaptiveCalibrationStateID"].values[0]),
+            "adaptive-state-test",
+        )
+        self.assertEqual(str(archived["ObservationCutoffUTC"].values[0]), issue.isoformat())
+        self.assertEqual(str(archived["SOCAuthoringAnchorPct"].values[0]), "70")
 
     def test_active_evaluation_filter_keeps_the_complete_system_version(self) -> None:
+        semantic_archive = {
+            "ForecastSystemVersion": ["v10", "v12"],
+            "FeatureSetVersion": ["features-v1", "features-v2"],
+            "FeatureSetDigest": ["digest-v1", "digest-v2"],
+            "ForecastCodeRevision": ["revision-v1", "revision-v2"],
+            "CandidateLane": ["baseline", "D_hybrid"],
+            "LocalFeatureContractID": ["local-v1", "local-v2"],
+            "BaselineControlContractID": ["control-v9", "control-v10"],
+            "BaselineControlSystemVersion": ["power-v9", "power-v10"],
+        }
         archive = xr.Dataset(
             {
                 "ForecastModelContractID": (("issue_time",), ["shared-contract", "shared-contract"]),
-                "ForecastSystemVersion": (("issue_time",), ["v10", "v12"]),
+                **{
+                    name: (("issue_time",), values)
+                    for name, values in semantic_archive.items()
+                },
             },
             coords={"issue_time": pd.date_range("2026-06-01", periods=2, freq="1D")},
         )
         table = pd.DataFrame(
             {
                 "forecast_model_contract_id": ["shared-contract", "shared-contract"],
-                "forecast_system_version": ["v10", "v12"],
+                "forecast_system_version": semantic_archive["ForecastSystemVersion"],
+                "feature_set_version": semantic_archive["FeatureSetVersion"],
+                "feature_set_digest": semantic_archive["FeatureSetDigest"],
+                "forecast_code_revision": semantic_archive["ForecastCodeRevision"],
+                "candidate_lane": semantic_archive["CandidateLane"],
+                "local_feature_contract_id": semantic_archive["LocalFeatureContractID"],
+                "baseline_control_contract_id": semantic_archive[
+                    "BaselineControlContractID"
+                ],
+                "baseline_control_system_version": semantic_archive[
+                    "BaselineControlSystemVersion"
+                ],
                 "error": [99.0, 1.0],
             }
         )
@@ -240,12 +402,16 @@ class HybridCandidateTests(unittest.TestCase):
             power_path = root / "source" / "power.zarr"
             input_path = root / "source" / "forcing.grib2"
             baseline_path = root / "baseline" / "power_soc_forecast.zarr"
+            baseline_issue_path = root / "baseline" / "issues" / "forecast.zarr"
             archive_path = root / "baseline" / "power_soc_forecast_archive.zarr"
             baseline_ensemble_path = root / "baseline" / "power_soc_ensemble_forecast.zarr"
             public_source_root = root / "public-source-inputs"
             power.to_zarr(power_path, mode="w", consolidated=True)
             input_path.write_bytes(b"v12 synthetic forcing")
-            with patch("generate_power_soc_forecast.open_provider_solar_forecast", return_value=provider):
+            with patch(
+                "generate_power_soc_forecast.open_provider_solar_forecast",
+                return_value=provider,
+            ) as provider_open:
                 generate(
                     power_zarr=power_path,
                     pdu_zarr=root / "source" / "missing-pdu.zarr",
@@ -262,8 +428,9 @@ class HybridCandidateTests(unittest.TestCase):
                     max_power_age_minutes=None,
                     archive_forecast=True,
                     state_override={"solar_calibration_factor_w_per_wm2": 8.0},
+                    issue_snapshot_zarr=baseline_issue_path,
                 )
-                with xr.open_zarr(baseline_path, chunks={}) as opened:
+                with xr.open_zarr(baseline_issue_path, chunks={}) as opened:
                     baseline_forecast = opened.load()
                 member_count = 3
                 member_grid = np.arange(1, member_count + 1, dtype=np.int16)
@@ -325,10 +492,11 @@ class HybridCandidateTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                baseline_digest = _tree_digest(baseline_path)
+                baseline_digest = _tree_digest(baseline_issue_path)
                 archive_digest = _tree_digest(archive_path)
+                input_path.unlink()
                 results = run_candidate(
-                    baseline_forecast_zarr=baseline_path,
+                    baseline_issue_zarr=baseline_issue_path,
                     baseline_archive_zarr=archive_path,
                     baseline_ensemble_zarr=baseline_ensemble_path,
                     candidate_root=root / "candidate",
@@ -338,7 +506,7 @@ class HybridCandidateTests(unittest.TestCase):
                     public_source_manifest_root=public_source_root,
                 )
                 repeated = run_candidate(
-                    baseline_forecast_zarr=baseline_path,
+                    baseline_issue_zarr=baseline_issue_path,
                     baseline_archive_zarr=archive_path,
                     baseline_ensemble_zarr=baseline_ensemble_path,
                     candidate_root=root / "candidate",
@@ -347,9 +515,11 @@ class HybridCandidateTests(unittest.TestCase):
                     physical_config=CONFIG_PATH,
                     public_source_manifest_root=public_source_root,
                 )
+                self.assertEqual(provider_open.call_count, 1)
             self.assertEqual(set(results), {"B_physical_solar", "C_load_residual", "D_physical_solar_load_residual"})
             self.assertEqual(results, repeated)
-            self.assertEqual(_tree_digest(baseline_path), baseline_digest)
+            self.assertFalse(input_path.exists())
+            self.assertEqual(_tree_digest(baseline_issue_path), baseline_digest)
             self.assertEqual(_tree_digest(archive_path), archive_digest)
             status = json.loads((root / "candidate" / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["status"], "complete")
@@ -363,7 +533,7 @@ class HybridCandidateTests(unittest.TestCase):
             with xr.open_zarr(results["C_load_residual"], chunks={}) as candidate:
                 np.testing.assert_allclose(
                     candidate["ForecastSolarWatts"].values,
-                    xr.open_zarr(baseline_path, chunks={})["ForecastSolarWatts"].values,
+                    xr.open_zarr(baseline_issue_path, chunks={})["ForecastSolarWatts"].values,
                     rtol=0.0,
                     atol=0.0,
                     equal_nan=True,
@@ -385,13 +555,27 @@ class HybridCandidateTests(unittest.TestCase):
                 / "pair_manifest.json"
             )
             self.assertTrue(manifest_path.exists())
-            self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8"))["pair_status"], "complete")
+            pair_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(pair_manifest["pair_status"], "complete")
+            self.assertEqual(
+                pair_manifest["artifact_digest_algorithm"],
+                PAIR_ARTIFACT_DIGEST_ALGORITHM,
+            )
+            self.assertEqual(
+                set(pair_manifest["artifact_checksums"]), {"baseline", "candidate"}
+            )
             ensemble_status = status["lanes"]["D_physical_solar_load_residual"]["memberwise_ensemble"]
             self.assertEqual(ensemble_status["status"], "complete", ensemble_status)
             source_manifest = next((root / "candidate" / "source_manifests").glob("*.json"))
             manifest = json.loads(source_manifest.read_text(encoding="utf-8"))
             self.assertIn("issue_time_features", manifest)
             self.assertIn("public_model_ablations", manifest)
+            self.assertEqual(manifest["solar_input_representation"], "embedded_site_irradiance")
+            self.assertFalse(manifest["global_grid_retained"])
+            self.assertRegex(manifest["site_irradiance_sha256"], r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(
+                manifest["baseline_issue_content_digest"], r"^sha256:[0-9a-f]{64}$"
+            )
 
     def test_campaign_evidence_excludes_incompatible_candidate_contracts(self) -> None:
         issue = pd.Timestamp("2026-06-01T00:00:00")
@@ -432,9 +616,13 @@ class HybridCandidateTests(unittest.TestCase):
                 bundle.mkdir(parents=True)
                 active.to_zarr(bundle / "baseline_forecast.zarr", mode="w", consolidated=True)
                 candidate.to_zarr(bundle / "candidate_forecast.zarr", mode="w", consolidated=True)
-                (bundle / "pair_manifest.json").write_text(
-                    json.dumps({"pair_status": "complete", "evaluation_pair_id": pair}),
-                    encoding="utf-8",
+                _write_integrity_pair_manifest(
+                    bundle,
+                    {"pair_status": "complete", "evaluation_pair_id": pair},
+                    {
+                        "baseline": "baseline_forecast.zarr",
+                        "candidate": "candidate_forecast.zarr",
+                    },
                 )
             power = xr.Dataset(
                 {
@@ -451,6 +639,137 @@ class HybridCandidateTests(unittest.TestCase):
             )
         self.assertEqual(evidence.sizes["record"], 2)
         self.assertEqual(evidence.attrs["incompatible_pair_count"], 1)
+
+    def test_campaign_evidence_retains_reanchors_but_scores_one_per_cycle_valid(self) -> None:
+        issue = pd.Timestamp("2026-06-01T00:00:00")
+        times = pd.date_range(issue, periods=2, freq="3h")
+        attrs = {
+            "initial_soc_time": issue.isoformat(),
+            "ecmwf_cycle_time": issue.isoformat(),
+            "forecast_model_contract_id": "candidate-contract",
+            "forecast_system_version": "power-v12-hybrid-candidate",
+            "feature_set_version": "features-v4",
+            "feature_set_digest": "digest-v4",
+            "forecast_code_revision": "revision-v4",
+            "candidate_lane": "D_physical_solar_load_residual",
+            "baseline_control_contract_id": "baseline-control",
+            "baseline_control_system_version": "v10-control",
+            "local_feature_contract_id": "issue-features-v1",
+            "forecast_identity_id": "identity",
+            "source_cycle_set_id": "same-source-cycle",
+            "source_availability_code": "ecmwf_control=available",
+            "initial_soc_pct": "80",
+        }
+        product = xr.Dataset(
+            {
+                "BatterySOCForecast": (("time",), [80.0, 79.0]),
+                "ForecastLoadWatts": (("time",), [100.0, 100.0]),
+                "ForecastSolarWatts": (("time",), [0.0, 0.0]),
+                "ECMWFSolarIrradiance": (("time",), [0.0, 0.0]),
+            },
+            coords={"time": times},
+            attrs=attrs,
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "pairs"
+            for pair in ("retry-one", "retry-two"):
+                bundle = root / pair / "signature"
+                bundle.mkdir(parents=True)
+                product.to_zarr(bundle / "baseline_forecast.zarr", mode="w", consolidated=True)
+                product.to_zarr(bundle / "candidate_forecast.zarr", mode="w", consolidated=True)
+                _write_integrity_pair_manifest(
+                    bundle,
+                    {"pair_status": "complete", "evaluation_pair_id": pair},
+                    {
+                        "baseline": "baseline_forecast.zarr",
+                        "candidate": "candidate_forecast.zarr",
+                    },
+                )
+            power = xr.Dataset(
+                {
+                    "BatterySOC": (("time",), [80.0, 79.0]),
+                    "ACOutputWatts": (("time",), [100.0, 100.0]),
+                },
+                coords={"time": times},
+            )
+            evidence = build_campaign_evidence(
+                root,
+                power,
+                lane="D_physical_solar_load_residual",
+                evaluation_contract=evaluation_contract_from_forecast(product),
+            )
+
+        self.assertEqual(evidence.sizes["record"], 4)
+        self.assertEqual(evidence.attrs["duplicate_cycle_valid_rows_discarded"], 0)
+        self.assertEqual(evidence.attrs["duplicate_cycle_valid_rows_retained"], 2)
+        self.assertEqual(
+            int(evidence["IndependentEvaluationSample"].sum().item()),
+            2,
+        )
+        np.testing.assert_array_equal(evidence["SOCAnchorTime"], evidence["IssueTime"])
+        summary = campaign_score_surfaces(evidence)["campaign_evidence"]["lead_buckets"]["0_6h"]
+        self.assertEqual(summary["cycles"], 1)
+        self.assertEqual(summary["samples"], 2)
+
+    def test_campaign_evidence_rejects_changed_pair_artifact_bytes(self) -> None:
+        issue = pd.Timestamp("2026-06-01T00:00:00")
+        times = pd.date_range(issue, periods=2, freq="3h")
+        product = xr.Dataset(
+            {
+                "BatterySOCForecast": (("time",), [80.0, 79.0]),
+                "ForecastLoadWatts": (("time",), [100.0, 100.0]),
+                "ForecastSolarWatts": (("time",), [0.0, 0.0]),
+                "ECMWFSolarIrradiance": (("time",), [0.0, 0.0]),
+            },
+            coords={"time": times},
+            attrs={
+                "initial_soc_time": issue.isoformat(),
+                "forecast_model_contract_id": "candidate-contract",
+                "forecast_system_version": "power-v12-hybrid-candidate",
+                "feature_set_version": "features-v4",
+                "feature_set_digest": "digest-v4",
+                "forecast_code_revision": "revision-v4",
+                "candidate_lane": "D_physical_solar_load_residual",
+                "baseline_control_contract_id": "baseline-control",
+                "baseline_control_system_version": "v10-control",
+                "local_feature_contract_id": "issue-features-v1",
+                "source_cycle_set_id": "cycle-one",
+                "initial_soc_pct": "80",
+            },
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "pairs"
+            bundle = root / "pair" / "signature"
+            bundle.mkdir(parents=True)
+            product.to_zarr(bundle / "baseline_forecast.zarr", mode="w", consolidated=True)
+            product.to_zarr(bundle / "candidate_forecast.zarr", mode="w", consolidated=True)
+            _write_integrity_pair_manifest(
+                bundle,
+                {"pair_status": "complete", "evaluation_pair_id": "pair"},
+                {
+                    "baseline": "baseline_forecast.zarr",
+                    "candidate": "candidate_forecast.zarr",
+                },
+            )
+            changed_file = next(
+                path
+                for path in (bundle / "candidate_forecast.zarr").rglob("*")
+                if path.is_file()
+            )
+            changed_file.write_bytes(changed_file.read_bytes() + b"changed")
+            power = xr.Dataset(
+                {"BatterySOC": (("time",), [80.0, 79.0])},
+                coords={"time": times},
+            )
+            evidence = build_campaign_evidence(
+                root,
+                power,
+                lane="D_physical_solar_load_residual",
+                evaluation_contract=evaluation_contract_from_forecast(product),
+            )
+
+        self.assertEqual(evidence.sizes["record"], 0)
+        self.assertEqual(evidence.attrs["evidence_status"], "no_complete_pair_bundles")
 
     def test_campaign_surface_reports_mpp_active_physical_solar_skill(self) -> None:
         issue = pd.Timestamp("2026-06-01T00:00:00")
@@ -503,6 +822,22 @@ class HybridCandidateTests(unittest.TestCase):
             dtype="datetime64[ns]",
         )
         count = len(issue_values)
+        source_cycles = np.repeat(
+            np.asarray([f"cycle-{index}" for index in range(len(issues))]),
+            len(leads),
+        )
+        load_modes = np.repeat(
+            np.asarray(
+                ["DC-Only" if index % 2 == 0 else "CL61" for index in range(len(issues))]
+            ),
+            len(leads),
+        )
+        cloud_regimes = np.repeat(
+            np.asarray(
+                ["clear" if index % 2 == 0 else "cloudy" for index in range(len(issues))]
+            ),
+            len(leads),
+        )
         evidence = xr.Dataset(
             {
                 "IssueTime": (("record",), issue_values),
@@ -520,6 +855,9 @@ class HybridCandidateTests(unittest.TestCase):
                 "ObservedSolarWatts": (("record",), np.full(count, 900.0)),
                 "SolarEvaluationAvailable": (("record",), np.ones(count, dtype=bool)),
                 "EvaluationAvailable": (("record",), np.ones(count, dtype=bool)),
+                "SourceCycleSetID": (("record",), source_cycles),
+                "LoadMode": (("record",), load_modes),
+                "CloudRegime": (("record",), cloud_regimes),
             },
             coords={"record": np.arange(count)},
         )
@@ -535,6 +873,39 @@ class HybridCandidateTests(unittest.TestCase):
         self.assertEqual(review["quantitative_gates"], "pass")
         self.assertEqual(review["ensemble"], "blocked_memberwise_candidate_not_generated")
         self.assertEqual(review["status"], "not_eligible")
+
+        missing_diversity = promotion_gate_review(
+            evidence.drop_vars(["CloudRegime", "LoadMode"])
+        )
+        self.assertEqual(missing_diversity["evidence"], "insufficient_evidence")
+        self.assertEqual(
+            missing_diversity["independent_evidence"]["0_6h"]["status"],
+            "insufficient_diversity",
+        )
+
+    def test_member_physics_direction_includes_battery_parasitic_load(self) -> None:
+        soc = np.asarray([[50.0, 49.0]])
+        solar = np.asarray([[np.nan, 100.0]])
+        load = np.asarray([[np.nan, 100.0]])
+        unavailable_flow = np.full((1, 2), np.nan)
+
+        _validate_member_soc_physics(
+            soc,
+            solar,
+            load,
+            unavailable_flow,
+            unavailable_flow,
+            np.asarray([10.0]),
+        )
+        with self.assertRaisesRegex(ValueError, "falls without net discharging"):
+            _validate_member_soc_physics(
+                soc,
+                solar,
+                load,
+                unavailable_flow,
+                unavailable_flow,
+                np.asarray([0.0]),
+            )
 
     def test_memberwise_candidate_ensemble_preserves_pair_and_replays_legacy_solar(self) -> None:
         issue = pd.Timestamp("2026-06-21T06:00:00")
@@ -651,6 +1022,17 @@ class HybridCandidateTests(unittest.TestCase):
                 manifest_extra={"baseline_publication_signature": "baseline-publication"},
             )
             self.assertTrue((bundle / "pair_manifest.json").exists())
+            ensemble_manifest = json.loads(
+                (bundle / "pair_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                ensemble_manifest["artifact_digest_algorithm"],
+                PAIR_ARTIFACT_DIGEST_ALGORITHM,
+            )
+            self.assertEqual(
+                set(ensemble_manifest["artifact_checksums"]),
+                {"baseline", "candidate"},
+            )
             power = xr.Dataset(
                 {"BatterySOC": (("time",), physical["BatterySOCForecastP50"].values)},
                 coords={"time": times},
@@ -661,7 +1043,20 @@ class HybridCandidateTests(unittest.TestCase):
                 lane="B_physical_solar",
                 evaluation_contract=ensemble_evaluation_contract_from_forecast(physical),
             )
+            changed_file = next(
+                path
+                for path in (bundle / "candidate_ensemble.zarr").rglob("*")
+                if path.is_file()
+            )
+            changed_file.write_bytes(changed_file.read_bytes() + b"changed")
+            rejected = build_campaign_ensemble_evidence(
+                root / "ensemble_pairs",
+                power,
+                lane="B_physical_solar",
+                evaluation_contract=ensemble_evaluation_contract_from_forecast(physical),
+            )
         self.assertEqual(evidence.sizes["record"], len(times))
+        self.assertEqual(rejected.sizes["record"], 0)
 
     def test_memberwise_ensemble_gate_requires_calibrated_spread_and_scores_brier(self) -> None:
         issues = pd.date_range("2026-06-01T00:00:00", periods=30, freq="8h")
@@ -698,3 +1093,29 @@ class HybridCandidateTests(unittest.TestCase):
         self.assertEqual(gate["crps_status"], "pass")
         self.assertEqual(gate["coverage_status"], "pass")
         self.assertEqual(gate["reserve_events"], "pass")
+
+    def test_ensemble_surface_counts_source_cycles_not_reissued_anchors(self) -> None:
+        issues = pd.date_range("2026-06-01", periods=4, freq="1h")
+        members = np.asarray([[60.0, 61.0, 62.0]] * 4)
+        evidence = xr.Dataset(
+            {
+                "IssueTime": (("record",), issues.to_numpy(dtype="datetime64[ns]")),
+                "ValidTime": (("record",), (issues + pd.Timedelta(hours=3)).to_numpy(dtype="datetime64[ns]")),
+                "LeadHours": (("record",), np.full(4, 3.0)),
+                "SourceCycleSetID": (("record",), np.asarray(["cycle-a", "cycle-a", "cycle-b", "cycle-b"])),
+                "SOCAuthoringAnchor": (("record",), np.full(4, 65.0)),
+                "ObservedSOC": (("record",), np.full(4, 61.0)),
+                "EvaluationAvailable": (("record",), np.ones(4, dtype=bool)),
+                "IndependentEvaluationSample": (
+                    ("record",), np.asarray([False, True, False, True])
+                ),
+                "CandidateSOCMembers": (("record", "member"), members),
+                "BaselineSOCMembers": (("record", "member"), members + 2.0),
+            },
+            coords={"record": np.arange(4), "member": np.arange(3)},
+        )
+
+        overall = campaign_ensemble_score_surfaces(evidence)["campaign_evidence"]["overall"]
+
+        self.assertEqual(overall["cycles"], 2)
+        self.assertEqual(overall["samples"], 2)

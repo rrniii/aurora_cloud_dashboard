@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import os
@@ -223,15 +224,27 @@ def auroracam_preview_cache_root() -> Path:
 
 
 def power_display_summary_path() -> Path:
-    return env_path("POWER_DISPLAY_SUMMARY_ZARR_PATH", "/data/aurora/products/power/power_display_summary.zarr")
+    legacy = env_path(
+        "POWER_DISPLAY_SUMMARY_ZARR_PATH",
+        "/data/aurora/products/power/power_display_summary.zarr",
+    )
+    return power_forecast_active_product_path("displaySummary") or legacy
 
 
 def power_display_section_path(section: str) -> Path:
     """Return the compact Power product used by one presentation section."""
     if section == "current":
-        return env_path("POWER_CURRENT_DISPLAY_ZARR_PATH", "/data/aurora/products/power/power_current_display.zarr")
+        legacy = env_path(
+            "POWER_CURRENT_DISPLAY_ZARR_PATH",
+            "/data/aurora/products/power/power_current_display.zarr",
+        )
+        return power_forecast_active_product_path("currentDisplay") or legacy
     if section == "forecast":
-        return env_path("POWER_FORECAST_DISPLAY_ZARR_PATH", "/data/aurora/products/power/power_forecast_display.zarr")
+        legacy = env_path(
+            "POWER_FORECAST_DISPLAY_ZARR_PATH",
+            "/data/aurora/products/power/power_forecast_display.zarr",
+        )
+        return power_forecast_active_display_path() or legacy
     return power_display_summary_path()
 
 
@@ -253,6 +266,321 @@ def power_candidate_evaluation_root() -> Path:
 
 def power_candidate_evaluation_enabled() -> bool:
     return os.environ.get("AURORA_POWER_CANDIDATE_API_ENABLED", "false").strip().lower() == "true"
+
+
+def power_forecast_orchestration_enabled() -> bool:
+    return (
+        os.environ.get("AURORA_POWER_FORECAST_ORCHESTRATION_ENABLED", "false")
+        .strip()
+        .lower()
+        == "true"
+    )
+
+
+def power_forecast_publication_active() -> bool:
+    """Return whether an accepted bundle may replace legacy Power products.
+
+    Orchestration and candidate evaluation can run in shadow mode for weeks.
+    That must not change the field forecast, its freshness state, or any
+    dashboard/mobile path until the separate publication switch is enabled.
+    """
+
+    return (
+        os.environ.get("AURORA_POWER_FORECAST_PUBLICATION_ACTIVE", "false")
+        .strip()
+        .lower()
+        == "true"
+    )
+
+
+def power_forecast_bundle_manifest_path() -> Path:
+    """Return the activation-safe manifest consumed by API/dashboard readers."""
+
+    return power_forecast_bundle_ready_path()
+
+
+def power_forecast_bundle_ready_path() -> Path:
+    return env_path(
+        "AURORA_POWER_FORECAST_BUNDLE_READY_PATH",
+        "/data/aurora/dev-products/power/forecast-bundle/active/generation.json",
+    )
+
+
+def power_forecast_active_display_path() -> Path | None:
+    """Resolve the activated immutable forecast artifact, if activation exists."""
+
+    return power_forecast_active_product_path("forecastDisplay")
+
+
+def power_forecast_active_product_path(logical_name: str) -> Path | None:
+    """Resolve one product from the activated immutable generation manifest."""
+
+    if not power_forecast_orchestration_enabled() or not power_forecast_publication_active():
+        return None
+    manifest_path = power_forecast_bundle_ready_path()
+    if not manifest_path.exists():
+        return None
+    manifest = read_json_file(manifest_path)
+    products = manifest.get("products")
+    product = products.get(logical_name) if isinstance(products, dict) else None
+    if manifest.get("status") != "complete" or not isinstance(product, dict):
+        return None
+    relative = str(product.get("relativePath") or "")
+    if not relative:
+        return None
+    try:
+        generation_root = manifest_path.resolve(strict=True).parent
+    except OSError:
+        return None
+    target = (generation_root / relative).resolve(strict=False)
+    if generation_root not in target.parents:
+        return None
+    return target
+
+
+def power_forecast_bundle_status_path() -> Path:
+    return env_path(
+        "AURORA_POWER_FORECAST_BUNDLE_STATUS_PATH",
+        "/data/aurora/dev-products/power/forecast_bundle_status.json",
+    )
+
+
+_POWER_BUNDLE_VALIDATION_CACHE: dict[str, Any] = {}
+
+
+def _power_bundle_artifact_digest(path: Path) -> str:
+    """Match the orchestrator's deterministic file/tree SHA256 contract."""
+
+    root = Path(path)
+    files = [root] if root.is_file() else sorted(
+        (candidate for candidate in root.rglob("*") if candidate.is_file()),
+        key=lambda candidate: candidate.relative_to(root).as_posix(),
+    )
+    digest = hashlib.sha256()
+    for candidate in files:
+        relative = candidate.name if root.is_file() else candidate.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with candidate.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def power_forecast_bundle_status(forecast_display_path: Path) -> dict[str, Any]:
+    """Validate the atomic development bundle before exposing forecast cards."""
+
+    if not power_forecast_orchestration_enabled():
+        return {"enabled": False, "status": "not_enabled"}
+    if not power_forecast_publication_active():
+        return {"enabled": False, "status": "shadow_unpublished"}
+    manifest_path = power_forecast_bundle_manifest_path()
+    external_path = power_forecast_bundle_status_path()
+    external = read_json_file(external_path)
+    if not manifest_path.exists():
+        activation_broken = manifest_path.is_symlink() or manifest_path.parent.is_symlink()
+        return {
+            "enabled": True,
+            "status": "unavailable" if activation_broken else "activation_pending",
+            "displaySource": "bundle" if activation_broken else "legacy",
+            "staleReason": (
+                "bundle_activation_broken"
+                if activation_broken
+                else "bundle_activation_pending"
+            ),
+            "dataUpdatedAt": "",
+        }
+    try:
+        stat_result = manifest_path.stat()
+        resolved_manifest = manifest_path.resolve(strict=True)
+    except OSError:
+        return {
+            "enabled": True,
+            "status": "unavailable",
+            "staleReason": "bundle_manifest_missing",
+            "dataUpdatedAt": str(external.get("dataUpdatedAt") or ""),
+        }
+    try:
+        external_stat = external_path.stat()
+        external_mtime = external_stat.st_mtime_ns
+        external_size = external_stat.st_size
+    except OSError:
+        external_mtime = 0
+        external_size = 0
+    external_digest = hashlib.sha256(
+        json.dumps(external, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    cache_key = (
+        f"{resolved_manifest}:{stat_result.st_mtime_ns}:{stat_result.st_size}:"
+        f"{external_mtime}:{external_size}:{external_digest}:"
+        f"{Path(forecast_display_path).resolve(strict=False)}"
+    )
+    cached = _POWER_BUNDLE_VALIDATION_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        result = dict(cached)
+        validity = _parse_utc(str(result.get("validUntil") or ""))
+        if validity is not None and validity < datetime.now(UTC):
+            result["status"] = "stale"
+            result["staleReason"] = "bundle_validity_expired"
+        return result
+    manifest = read_json_file(resolved_manifest)
+    products = manifest.get("products")
+    failure = ""
+    verified: list[str] = []
+    generation_root = resolved_manifest.parent.resolve()
+    if manifest.get("status") != "complete" or not isinstance(products, dict):
+        failure = "bundle_manifest_incomplete"
+    elif manifest.get("controlAuthority") != "advisory_only" or manifest.get(
+        "cl61ActuationEnabled"
+    ) is not False:
+        failure = "bundle_control_boundary_invalid"
+    else:
+        for logical_name, record in sorted(products.items()):
+            if not isinstance(record, dict):
+                failure = f"bundle_product_invalid:{logical_name}"
+                break
+            relative = str(record.get("relativePath") or "")
+            expected = str(record.get("sha256") or "").removeprefix("sha256:").lower()
+            target = (generation_root / relative).resolve(strict=False)
+            if not relative or generation_root not in target.parents:
+                failure = f"bundle_product_path_invalid:{logical_name}"
+                break
+            if not target.exists() or not expected:
+                failure = f"bundle_product_missing:{logical_name}"
+                break
+            try:
+                actual = _power_bundle_artifact_digest(target)
+            except OSError:
+                failure = f"bundle_product_unreadable:{logical_name}"
+                break
+            if actual != expected:
+                failure = f"bundle_product_digest_mismatch:{logical_name}"
+                break
+            verified.append(str(logical_name))
+        forecast_record = products.get("forecastDisplay") if isinstance(products, dict) else None
+        if not failure and not isinstance(forecast_record, dict):
+            failure = "bundle_forecast_display_missing"
+        elif not failure:
+            expected_forecast = (
+                generation_root / str(forecast_record.get("relativePath") or "")
+            ).resolve(strict=False)
+            if Path(forecast_display_path).resolve(strict=False) != expected_forecast:
+                failure = "bundle_forecast_display_path_mismatch"
+    if failure:
+        result = {
+            "enabled": True,
+            "status": "unavailable",
+            "displaySource": "bundle",
+            "staleReason": failure,
+            "dataUpdatedAt": str(external.get("dataUpdatedAt") or ""),
+        }
+    else:
+        external_status = str(external.get("status") or "unavailable")
+        external_reason = str(
+            external.get("staleReason")
+            or external.get("failedStage")
+            or ("bundle_status_missing" if not external else "latest_bundle_run_failed")
+        )
+        result = {
+            "enabled": True,
+            # Artifact validity and the health of the latest generation attempt
+            # are separate facts. A failed/deferred attempt must not make an
+            # otherwise valid retained generation falsely stale.
+            "status": "complete",
+            "displaySource": "bundle",
+            "requestedAt": str(manifest.get("requestedAt") or ""),
+            "dataUpdatedAt": str(manifest.get("dataUpdatedAt") or ""),
+            "validUntil": str(manifest.get("validUntil") or ""),
+            "forecastIdentityID": str(manifest.get("forecastIdentityID") or ""),
+            "sourceCycleSetID": str(manifest.get("sourceCycleSetID") or ""),
+            "forecastRefreshKind": str(manifest.get("forecastRefreshKind") or ""),
+            "independentCycle": (
+                manifest.get("independentCycle")
+                if isinstance(manifest.get("independentCycle"), bool)
+                else False
+            ),
+            "degradedModeCode": str(manifest.get("degradedModeCode") or ""),
+            "observationCutoffUTC": str(manifest.get("observationCutoffUTC") or ""),
+            "forecastCodeRevision": str(manifest.get("forecastCodeRevision") or ""),
+            "calibrationStateID": str(manifest.get("calibrationStateID") or ""),
+            "controlAuthority": "advisory_only",
+            "cl61ActuationEnabled": False,
+            "lastAttemptStatus": external_status,
+            "lastAttemptReason": external_reason if external_status not in {"complete", "current"} else "",
+            "lastAttemptRequestedAt": str(external.get("requestedAt") or ""),
+            "lastAttemptUpdatedAt": str(
+                external.get("updatedAt") or external.get("dataUpdatedAt") or ""
+            ),
+            "verifiedProducts": verified,
+        }
+        validity = _parse_utc(str(result.get("validUntil") or ""))
+        if validity is None:
+            result["status"] = "stale"
+            result["staleReason"] = "bundle_validity_unknown"
+        elif validity < datetime.now(UTC):
+            result["status"] = "stale"
+            result["staleReason"] = "bundle_validity_expired"
+        else:
+            degraded = str(result.get("degradedModeCode") or "").strip().lower()
+            if degraded not in {"", "none", "normal", "nominal"}:
+                result["status"] = "degraded"
+    _POWER_BUNDLE_VALIDATION_CACHE.clear()
+    _POWER_BUNDLE_VALIDATION_CACHE[cache_key] = dict(result)
+    return result
+
+
+def _power_physical_drivers(dataset: Any) -> dict[str, Any]:
+    """Expose the exact physical terms embedded in a display artifact."""
+
+    attrs = getattr(dataset, "attrs", {})
+
+    def text_value(name: str) -> str:
+        return str(attrs.get(name, "")).strip()
+
+    def numeric_value(name: str) -> float | None:
+        try:
+            value = float(attrs.get(name, ""))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    result: dict[str, Any] = {
+        "solarModelName": text_value("forecast_solar_model_name"),
+        "solarPowerSemantics": text_value("forecast_solar_power_semantics"),
+        "solarForcingMode": text_value("forecast_solar_forcing_mode"),
+        "loadModel": text_value("forecast_load_model"),
+        "loadMode": text_value("forecast_load_mode"),
+        "loadPhase": text_value("forecast_load_current_phase"),
+        "solarCalibrationStateID": text_value(
+            "forecast_solar_calibration_contract_id"
+        ),
+        "loadResidualStatus": text_value("forecast_load_residual_model_status"),
+        "socCorrectionMethod": text_value("forecast_soc_bias_correction_method"),
+        "physicalConsistencyStatus": text_value(
+            "forecast_soc_physical_consistency_status"
+        ),
+        "batteryUsableCapacityKWh": numeric_value(
+            "forecast_battery_usable_capacity_kwh"
+        ),
+        "chargeEfficiency": numeric_value("forecast_battery_charge_efficiency"),
+        "dischargeEfficiency": numeric_value(
+            "forecast_battery_discharge_efficiency"
+        ),
+        "batteryParasiticLoadWatts": numeric_value(
+            "forecast_battery_parasitic_load_w"
+        ),
+        "batteryMaxChargeWatts": numeric_value("forecast_battery_max_charge_w"),
+        "batteryMaxDischargeWatts": numeric_value(
+            "forecast_battery_max_discharge_w"
+        ),
+        "loadBiasCorrectionWatts": numeric_value("forecast_load_bias_correction_w"),
+    }
+    return {
+        name: value
+        for name, value in result.items()
+        if value not in {None, ""}
+    }
 
 
 def cl61_automation_status_path() -> Path:
@@ -348,6 +676,9 @@ def _representative_power_indices(values, maximum: int = MOBILE_POWER_MAX_POINTS
 
 def power_operating_scenario_paths() -> tuple[Path, ...]:
     """Locate the authoritative operating-plan product for native clients."""
+    active = power_forecast_active_product_path("operatingScenarios")
+    if active is not None:
+        return (active,)
     configured = env_path(
         "POWER_OPERATING_SCENARIOS_ZARR_PATH",
         "/data/aurora/products/power/power_operating_scenarios.zarr",
@@ -1861,6 +2192,40 @@ def power(window: str = "24h", group: str = "all") -> dict[str, Any]:
         "minimumOperationalSOCPct": 40,
         "panels": [],
     }
+    # Once the immutable bundle has been activated, every Power section is a
+    # member of that generation. Validate the complete generation even for an
+    # observed/current request so a corrupt active product cannot be mixed
+    # with legacy siblings. Before first activation the explicit
+    # ``activation_pending`` status keeps the legacy paths available.
+    bundle_status = power_forecast_bundle_status(
+        power_display_section_path("forecast")
+    )
+    if bundle_status.get("enabled"):
+        payload["publicationStatus"] = bundle_status
+        payload["status"] = str(bundle_status.get("status", ""))
+        payload["requestedAt"] = payload["serverTime"]
+        for name in (
+            "dataUpdatedAt",
+            "validUntil",
+            "forecastIdentityID",
+            "sourceCycleSetID",
+            "degradedModeCode",
+            "observationCutoffUTC",
+            "forecastCodeRevision",
+            "calibrationStateID",
+            "forecastRefreshKind",
+            "independentCycle",
+            "staleReason",
+            "lastAttemptStatus",
+            "lastAttemptReason",
+            "lastAttemptRequestedAt",
+            "lastAttemptUpdatedAt",
+        ):
+            if bundle_status.get(name) not in {None, ""}:
+                payload[name] = bundle_status[name]
+        if bundle_status.get("status") == "unavailable":
+            payload["warning"] = "Power forecast bundle is unavailable or failed validation"
+            return payload
     if not path.exists():
         payload["warning"] = "Power display-summary product is unavailable"
         return payload
@@ -1885,6 +2250,30 @@ def power(window: str = "24h", group: str = "all") -> dict[str, Any]:
         horizon = 24 if window == "24h" else 96
         end = now + pd.Timedelta(hours=horizon)
         dataset = xr.open_zarr(path, chunks={"time": 1440}, consolidated=True)
+        physical_drivers = _power_physical_drivers(dataset)
+        if physical_drivers:
+            payload["physicalDrivers"] = physical_drivers
+        if bundle_status.get("enabled"):
+            dataset.attrs["api_bundle_status"] = str(bundle_status.get("status", ""))
+            dataset.attrs["api_bundle_stale_reason"] = str(
+                bundle_status.get("staleReason", "")
+            )
+            for source_name, target_name in (
+                ("dataUpdatedAt", "forecast_generated_at_utc"),
+                ("forecastIdentityID", "forecast_identity_id"),
+                ("sourceCycleSetID", "forecast_source_cycle_set_id"),
+                ("degradedModeCode", "forecast_degraded_mode_code"),
+                ("observationCutoffUTC", "forecast_observation_cutoff_utc"),
+                ("forecastCodeRevision", "forecast_code_revision"),
+                ("calibrationStateID", "forecast_adaptive_calibration_state_id"),
+                ("forecastRefreshKind", "forecast_refresh_kind"),
+                ("independentCycle", "forecast_independent_cycle"),
+            ):
+                value = bundle_status.get(source_name)
+                if value not in {None, ""}:
+                    dataset.attrs[target_name] = (
+                        bool(value) if source_name == "independentCycle" else str(value)
+                    )
         # The display summary can lag behind the fast planner.  Always replace
         # baked operating traces with the standalone contract, which rejects a
         # plan whose SOC anchor differs from the current ensemble forecast.
@@ -1906,7 +2295,11 @@ def power(window: str = "24h", group: str = "all") -> dict[str, Any]:
         dataset = dataset.sel(time=slice(start, end))
         times = pd.DatetimeIndex(dataset["time"].values)
         if group == "all":
-            selected_groups = tuple(POWER_PANEL_TIME_GROUPS)
+            selected_groups = (
+                ("observed",)
+                if bundle_status.get("status") == "unavailable"
+                else tuple(POWER_PANEL_TIME_GROUPS)
+            )
         elif group == "current":
             selected_groups = ("observed",)
         elif group == "forecast":
@@ -2006,6 +2399,7 @@ def power_solar_evaluation(lane: str = "D_physical_solar_load_residual") -> dict
     can never mistake a candidate trace for an operational power forecast,
     including when it falls back from the production host to data-ocean.
     """
+    requested_at = utc_now_iso()
     allowed = {"B_physical_solar", "C_load_residual", "D_physical_solar_load_residual"}
     if not power_candidate_evaluation_enabled():
         raise KeyError("Power candidate evaluation is disabled on this host")
@@ -2013,12 +2407,62 @@ def power_solar_evaluation(lane: str = "D_physical_solar_load_residual") -> dict
         raise KeyError("Unsupported Power candidate lane")
     root = power_candidate_evaluation_root()
     status = read_json_file(root / "status.json")
-    if (
-        status.get("environment") != "development"
-        or status.get("authority") != "candidate"
-        or status.get("status") != "complete"
-    ):
+    run_status = read_json_file(root / "run_status.json")
+    last_attempt_status = str(run_status.get("status") or "unknown")
+    last_attempt_reason = str(run_status.get("reason_code") or "")
+    last_attempt_requested = str(run_status.get("requested_at_utc") or "")
+    last_attempt_updated = str(run_status.get("updated_at_utc") or "")
+    if status.get("environment") != "development" or status.get("authority") not in {
+        None,
+        "candidate",
+    }:
         raise KeyError("Power candidate evaluation is not available")
+    if status.get("status") != "complete":
+        data_updated_at = str(
+            status.get("data_updated_at_utc") or status.get("updated_at_utc") or ""
+        )
+        unavailable_code = str(status.get("status") or "status_missing")
+        return {
+            "environment": "development",
+            "authority": "candidate",
+            "status": "unavailable",
+            "lane": lane,
+            "requestedAt": requested_at,
+            "dataUpdatedAt": data_updated_at,
+            "generatedAt": data_updated_at,
+            "validUntil": str(status.get("valid_until_utc") or ""),
+            "staleReason": f"candidate_run_{unavailable_code}",
+            "degradedModeCode": unavailable_code,
+            "baselineSignature": "",
+            "candidateSignature": "",
+            "pairID": "",
+            "forecastSystemVersion": "",
+            "forecastModelContractID": "",
+            "forecastIdentityID": "",
+            "featureSetVersion": "",
+            "featureSetDigest": "",
+            "sourceManifestDigest": "",
+            "sourceCycleSetID": "",
+            "sourceAvailabilityCode": "",
+            "localFeatureContractID": "",
+            "baselineControlContractID": "",
+            "observationCutoffUTC": "",
+            "forecastCodeRevision": "",
+            "calibrationStateID": "",
+            "loadResidualStatus": "",
+            "memberwiseEnsemble": {},
+            "publicSourceAblations": {},
+            "promotionStatus": "unavailable",
+            "physicalDrivers": {},
+            "comparison": [],
+            "evaluation": {},
+            "campaignEvidence": {},
+            "promotionGates": {},
+            "lastAttemptStatus": last_attempt_status,
+            "lastAttemptReason": last_attempt_reason,
+            "lastAttemptRequestedAt": last_attempt_requested,
+            "lastAttemptUpdatedAt": last_attempt_updated,
+        }
     lane_status = status.get("lanes", {}).get(lane) if isinstance(status.get("lanes"), dict) else None
     if not isinstance(lane_status, dict):
         raise KeyError("Power candidate lane is not available")
@@ -2094,17 +2538,79 @@ def power_solar_evaluation(lane: str = "D_physical_solar_load_residual") -> dict
                 )
                 if field in value
             }
+    data_updated_at = str(
+        status.get("data_updated_at_utc")
+        or status.get("updated_at_utc")
+        or candidate_attrs.get("generated_at_utc", "")
+    )
+    valid_until = str(
+        lane_status.get("valid_until_utc")
+        or status.get("valid_until_utc")
+        or (pd.Timestamp(times.max()).isoformat() + "Z" if len(times) else "")
+    )
+    valid_moment = _parse_utc(valid_until)
+    degraded_mode = str(candidate_attrs.get("degraded_mode_code", "")).strip()
+    if valid_moment is not None and valid_moment < datetime.now(UTC):
+        response_status = "stale"
+        stale_reason: str | None = "forecast_validity_ended"
+    elif valid_moment is None:
+        response_status = "degraded"
+        stale_reason = "valid_until_unknown"
+    elif degraded_mode and degraded_mode.lower() not in {"none", "nominal"}:
+        response_status = "degraded"
+        stale_reason = None
+    else:
+        response_status = "candidate"
+        stale_reason = None
+
+    def numeric_attr(name: str) -> float | None:
+        try:
+            value = float(candidate_attrs.get(name, ""))
+        except (TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) else None
+
+    physical_drivers = {
+        "solarModelName": str(candidate_attrs.get("solar_model_name", "")),
+        "solarPowerSemantics": str(candidate_attrs.get("solar_power_semantics", "")),
+        "solarForcingMode": str(candidate_attrs.get("solar_forcing_mode", "")),
+        "loadModel": str(candidate_attrs.get("load_model", "")),
+        "loadMode": str(candidate_attrs.get("load_mode", "")),
+        "loadPhase": str(candidate_attrs.get("load_current_phase", "")),
+        "solarCalibrationStateID": str(
+            candidate_attrs.get("solar_calibration_contract_id", "")
+        ),
+        "loadResidualStatus": str(candidate_attrs.get("load_residual_model_status", "")),
+        "socCorrectionMethod": str(candidate_attrs.get("soc_bias_correction_method", "")),
+        "physicalConsistencyStatus": str(
+            candidate_attrs.get("soc_physical_consistency_status", "")
+        ),
+        "batteryUsableCapacityKWh": numeric_attr("battery_usable_capacity_kwh"),
+        "chargeEfficiency": numeric_attr("battery_charge_efficiency"),
+        "dischargeEfficiency": numeric_attr("battery_discharge_efficiency"),
+        "batteryParasiticLoadWatts": numeric_attr("battery_parasitic_load_w"),
+        "batteryMaxChargeWatts": numeric_attr("battery_max_charge_w"),
+        "batteryMaxDischargeWatts": numeric_attr("battery_max_discharge_w"),
+        "loadBiasCorrectionWatts": numeric_attr("load_bias_correction_w"),
+    }
     return {
         "environment": "development",
         "authority": "candidate",
-        "status": "candidate",
+        "status": response_status,
         "lane": lane,
-        "generatedAt": utc_now_iso(),
+        # generatedAt is retained for old clients, but now describes the data
+        # artifact rather than falsely refreshing on every API request.
+        "generatedAt": data_updated_at,
+        "requestedAt": requested_at,
+        "dataUpdatedAt": data_updated_at,
+        "validUntil": valid_until,
+        **({"staleReason": stale_reason} if stale_reason is not None else {}),
         "baselineSignature": str(pair_manifest.get("baseline_publication_signature", "")),
         "candidateSignature": signature,
         "pairID": str(pair_manifest.get("evaluation_pair_id", "")),
         "forecastSystemVersion": str(candidate_attrs.get("forecast_system_version", "")),
         "forecastModelContractID": str(candidate_attrs.get("forecast_model_contract_id", "")),
+        "forecastIdentityID": str(candidate_attrs.get("forecast_identity_id", "")),
         "featureSetVersion": str(candidate_attrs.get("feature_set_version", "")),
         "featureSetDigest": str(candidate_attrs.get("feature_set_digest", "")),
         "sourceManifestDigest": str(candidate_attrs.get("source_manifest_digest", "")),
@@ -2113,11 +2619,30 @@ def power_solar_evaluation(lane: str = "D_physical_solar_load_residual") -> dict
         "localFeatureContractID": str(candidate_attrs.get("local_feature_contract_id", "")),
         "baselineControlContractID": str(candidate_attrs.get("baseline_control_contract_id", "")),
         "degradedModeCode": str(candidate_attrs.get("degraded_mode_code", "")),
+        "observationCutoffUTC": str(
+            candidate_attrs.get(
+                "observation_cutoff_utc", status.get("observation_cutoff_utc", "")
+            )
+        ),
+        "forecastCodeRevision": str(candidate_attrs.get("forecast_code_revision", "")),
+        "calibrationStateID": str(
+            candidate_attrs.get(
+                "adaptive_calibration_state_id",
+                status.get("adaptive_calibration_state_id", ""),
+            )
+        ),
         "loadResidualStatus": str(candidate_attrs.get("load_residual_model_status", "")),
         "memberwiseEnsemble": lane_status.get("memberwise_ensemble", {}),
         "publicSourceAblations": safe_public_ablations,
         "promotionStatus": str(status.get("promotion_status", "")),
         "evaluation": summary,
+        "campaignEvidence": summary.get("campaign_evidence", {}),
+        "promotionGates": summary.get("promotion_gates", {}),
+        "physicalDrivers": physical_drivers,
+        "lastAttemptStatus": last_attempt_status,
+        "lastAttemptReason": last_attempt_reason,
+        "lastAttemptRequestedAt": last_attempt_requested,
+        "lastAttemptUpdatedAt": last_attempt_updated,
         "comparison": points,
     }
 
@@ -2244,14 +2769,57 @@ def _power_forecast_context(dataset, panel_key: str, traces: list[dict[str, Any]
     if not end_times:
         return None
     kind, anchor, issued, horizon = _power_forecast_basis(dataset, panel_key)
-    return {
+    valid_until = min(end_times).isoformat() + "Z"
+    valid_moment = _parse_utc(valid_until)
+    degraded_mode = str(dataset.attrs.get("forecast_degraded_mode_code", "")).strip()
+    bundle_status = str(dataset.attrs.get("api_bundle_status", "")).strip()
+    if bundle_status == "stale":
+        status = "stale"
+        stale_reason = str(
+            dataset.attrs.get("api_bundle_stale_reason", "latest_bundle_run_failed")
+        )
+    elif valid_moment is not None and valid_moment < datetime.now(UTC):
+        status = "stale"
+        stale_reason = "forecast_validity_ended"
+    elif degraded_mode and degraded_mode.lower() not in {"none", "nominal"}:
+        status = "degraded"
+        stale_reason = None
+    else:
+        status = "current"
+        stale_reason = None
+    context = {
         "kind": kind,
         "anchorTime": str(anchor),
         "issuedTime": str(issued),
         # The minimum end time is the last valid point shared by every trace.
-        "validTime": min(end_times).isoformat() + "Z",
+        "validTime": valid_until,
+        "validUntil": valid_until,
         "horizonHours": horizon,
+        "status": status,
+        "dataUpdatedAt": str(issued),
+        "forecastSystemVersion": str(dataset.attrs.get("forecast_system_version", "")),
+        "forecastModelContractID": str(
+            dataset.attrs.get("forecast_model_contract_id", "")
+        ),
+        "forecastIdentityID": str(dataset.attrs.get("forecast_identity_id", "")),
+        "sourceCycleSetID": str(dataset.attrs.get("forecast_source_cycle_set_id", "")),
+        "observationCutoffUTC": str(
+            dataset.attrs.get("forecast_observation_cutoff_utc", "")
+        ),
+        "forecastCodeRevision": str(dataset.attrs.get("forecast_code_revision", "")),
+        "calibrationStateID": str(
+            dataset.attrs.get("forecast_adaptive_calibration_state_id", "")
+        ),
+        "forecastRefreshKind": str(dataset.attrs.get("forecast_refresh_kind", "")),
+        "independentCycle": str(
+            dataset.attrs.get("forecast_independent_cycle", "false")
+        ).strip().lower()
+        == "true",
+        "degradedModeCode": degraded_mode,
     }
+    if stale_reason is not None:
+        context["staleReason"] = stale_reason
+    return context
 
 
 def uas(window: str = "24h") -> dict[str, Any]:

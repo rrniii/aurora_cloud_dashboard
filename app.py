@@ -915,10 +915,13 @@ _POWER_DISPLAY_ENERGY_DS: xr.Dataset | None = None
 _POWER_DISPLAY_ENERGY_REFRESHED_AT: datetime | None = None
 _POWER_DISPLAY_SUMMARY_DS: xr.Dataset | None = None
 _POWER_DISPLAY_SUMMARY_REFRESHED_AT: datetime | None = None
+_POWER_DISPLAY_SUMMARY_SOURCE_PATH: Path | None = None
 _POWER_DISPLAY_SECTION_DS: dict[str, xr.Dataset] = {}
 _POWER_DISPLAY_SECTION_REFRESHED_AT: dict[str, datetime] = {}
+_POWER_DISPLAY_SECTION_SOURCE_PATH: dict[str, Path] = {}
 _POWER_OPERATING_SCENARIOS_DS: xr.Dataset | None = None
 _POWER_OPERATING_SCENARIOS_REFRESHED_AT: datetime | None = None
+_POWER_OPERATING_SCENARIOS_SOURCE_PATH: Path | None = None
 _OPS_TREND_CACHE: dict[str, object] = {"updated_at": None, "markup": ""}
 _SESSION_PERIODIC_CALLBACKS: list[object] = []
 
@@ -960,23 +963,20 @@ def _power_display_energy_path() -> Path:
 
 
 def _power_display_summary_path() -> Path:
-    return Path(os.environ.get("POWER_DISPLAY_SUMMARY_ZARR_PATH", "/data/aurora/products/power/power_display_summary.zarr"))
+    return mobile_catalog.power_display_summary_path()
 
 
 def _power_display_section_path(section: str) -> Path:
     """Return the compact display store for one Power browser section."""
-    if section == "current":
-        configured = os.environ.get("POWER_CURRENT_DISPLAY_ZARR_PATH", "").strip()
-        default = "/data/aurora/products/power/power_current_display.zarr"
-    elif section == "forecast":
-        configured = os.environ.get("POWER_FORECAST_DISPLAY_ZARR_PATH", "").strip()
-        default = "/data/aurora/products/power/power_forecast_display.zarr"
-    else:
+    if section not in {"current", "forecast"}:
         raise ValueError(f"Unsupported Power display section: {section}")
-    return Path(configured or default)
+    return mobile_catalog.power_display_section_path(section)
 
 
 def _power_display_summary_metadata_path() -> Path:
+    active = mobile_catalog.power_forecast_active_product_path("displayManifest")
+    if active is not None:
+        return active
     configured = os.environ.get("POWER_DISPLAY_SUMMARY_METADATA_PATH", "").strip()
     if configured:
         return Path(configured)
@@ -996,19 +996,12 @@ def _power_display_summary_time_bounds_metadata() -> tuple[datetime | None, date
 
 
 def _power_operating_scenarios_path() -> Path:
-    return Path(
-        os.environ.get(
-            "POWER_OPERATING_SCENARIOS_ZARR_PATH",
-            "/data/aurora/products/power/power_operating_scenarios.zarr",
-        )
-    )
+    return mobile_catalog.power_operating_scenario_paths()[0]
 
 
 def _power_operating_scenario_paths() -> tuple[Path, ...]:
     """Return the configured scenario store followed by the mirrored live store."""
-    configured = _power_operating_scenarios_path()
-    mirrored = Path("/data/aurora/products/power/power_operating_scenarios.zarr")
-    return tuple(dict.fromkeys((configured, mirrored)))
+    return mobile_catalog.power_operating_scenario_paths()
 
 
 def _power_operating_recommendations_path() -> Path:
@@ -1025,6 +1018,16 @@ def _prewarmed_interactive_dir() -> Path:
 def _prewarmed_interactive_path(inst: str) -> Path:
     if inst == "power":
         section = power_view_select.value if "power_view_select" in globals() else "current"
+        active_forecast = (
+            mobile_catalog.power_forecast_active_display_path()
+            if section == "forecast"
+            else None
+        )
+        if active_forecast is not None:
+            # The legacy prewarm is not part of the immutable generation. Once
+            # activated, render from the validated bundle instead of mixing it
+            # with an older Plotly cache.
+            return active_forecast.parent / ".forecast-prewarm-not-published.json"
         return _prewarmed_interactive_dir() / f"power_{section}_latest_interactive.json"
     safe = inst.replace(" ", "_").replace("-", "_").lower()
     return _prewarmed_interactive_dir() / f"{safe}_latest_interactive.json"
@@ -1176,9 +1179,26 @@ def _get_power_display_energy_dataset() -> xr.Dataset | None:
 def _get_power_display_summary_dataset() -> xr.Dataset | None:
     """Open the legacy combined Power display store as a compatibility fallback."""
     global _POWER_DISPLAY_SUMMARY_DS, _POWER_DISPLAY_SUMMARY_REFRESHED_AT
-    if _POWER_DISPLAY_SUMMARY_DS is not None:
-        return _POWER_DISPLAY_SUMMARY_DS
+    global _POWER_DISPLAY_SUMMARY_SOURCE_PATH
+    publication = mobile_catalog.power_forecast_bundle_status(
+        _power_display_section_path("forecast")
+    )
+    if publication.get("enabled") and publication.get("status") == "unavailable":
+        return None
     path = _power_display_summary_path()
+    if (
+        _POWER_DISPLAY_SUMMARY_DS is not None
+        and _POWER_DISPLAY_SUMMARY_SOURCE_PATH == path
+    ):
+        return _POWER_DISPLAY_SUMMARY_DS
+    if _POWER_DISPLAY_SUMMARY_DS is not None:
+        try:
+            _POWER_DISPLAY_SUMMARY_DS.close()
+        except Exception:
+            pass
+        _POWER_DISPLAY_SUMMARY_DS = None
+        _POWER_DISPLAY_SUMMARY_REFRESHED_AT = None
+        _POWER_DISPLAY_SUMMARY_SOURCE_PATH = None
     if not path.exists():
         return None
     with _timed_perf("power_display_summary_open", instrument="power", zarr_path=str(path)) as perf:
@@ -1194,6 +1214,7 @@ def _get_power_display_summary_dataset() -> xr.Dataset | None:
         perf["var_count"] = len(ds.data_vars)
     _POWER_DISPLAY_SUMMARY_DS = ds
     _POWER_DISPLAY_SUMMARY_REFRESHED_AT = datetime.now(timezone.utc)
+    _POWER_DISPLAY_SUMMARY_SOURCE_PATH = path
     return ds
 
 
@@ -1203,10 +1224,24 @@ def _get_power_display_section_dataset(section: str) -> xr.Dataset | None:
     The combined store is retained for existing scripts and old deployments, but
     normal browser renders must not open all observed and forecast fields.
     """
-    cached = _POWER_DISPLAY_SECTION_DS.get(section)
-    if cached is not None:
-        return cached
     path = _power_display_section_path(section)
+    if section in {"current", "forecast"}:
+        publication = mobile_catalog.power_forecast_bundle_status(
+            _power_display_section_path("forecast")
+        )
+        if publication.get("enabled") and publication.get("status") == "unavailable":
+            return None
+    cached = _POWER_DISPLAY_SECTION_DS.get(section)
+    if cached is not None and _POWER_DISPLAY_SECTION_SOURCE_PATH.get(section) == path:
+        return cached
+    if cached is not None:
+        try:
+            cached.close()
+        except Exception:
+            pass
+        _POWER_DISPLAY_SECTION_DS.pop(section, None)
+        _POWER_DISPLAY_SECTION_REFRESHED_AT.pop(section, None)
+        _POWER_DISPLAY_SECTION_SOURCE_PATH.pop(section, None)
     if not path.exists():
         return None
     with _timed_perf("power_display_section_open", instrument="power", section=section, zarr_path=str(path)) as perf:
@@ -1221,16 +1256,19 @@ def _get_power_display_section_dataset(section: str) -> xr.Dataset | None:
         perf["var_count"] = len(ds.data_vars)
     _POWER_DISPLAY_SECTION_DS[section] = ds
     _POWER_DISPLAY_SECTION_REFRESHED_AT[section] = datetime.now(timezone.utc)
+    _POWER_DISPLAY_SECTION_SOURCE_PATH[section] = path
     return ds
 
 
 def _get_power_operating_scenarios_dataset() -> xr.Dataset | None:
     """Open the compact learned operating-plan product when available."""
     global _POWER_OPERATING_SCENARIOS_DS, _POWER_OPERATING_SCENARIOS_REFRESHED_AT
+    global _POWER_OPERATING_SCENARIOS_SOURCE_PATH
     required = {"component", "SolarEnsembleWatts", "ComponentLoadWatts"}
+    paths = _power_operating_scenario_paths()
     if _POWER_OPERATING_SCENARIOS_DS is not None and required.issubset(
         set(_POWER_OPERATING_SCENARIOS_DS.variables)
-    ):
+    ) and _POWER_OPERATING_SCENARIOS_SOURCE_PATH in paths:
         return _POWER_OPERATING_SCENARIOS_DS
     if _POWER_OPERATING_SCENARIOS_DS is not None:
         try:
@@ -1239,7 +1277,8 @@ def _get_power_operating_scenarios_dataset() -> xr.Dataset | None:
             pass
         _POWER_OPERATING_SCENARIOS_DS = None
         _POWER_OPERATING_SCENARIOS_REFRESHED_AT = None
-    for path in _power_operating_scenario_paths():
+        _POWER_OPERATING_SCENARIOS_SOURCE_PATH = None
+    for path in paths:
         if not path.exists():
             continue
         with _timed_perf("power_operating_scenarios_open", instrument="power", zarr_path=str(path)) as perf:
@@ -1262,6 +1301,7 @@ def _get_power_operating_scenarios_dataset() -> xr.Dataset | None:
             perf["dims"] = dict(ds.sizes)
         _POWER_OPERATING_SCENARIOS_DS = ds
         _POWER_OPERATING_SCENARIOS_REFRESHED_AT = datetime.now(timezone.utc)
+        _POWER_OPERATING_SCENARIOS_SOURCE_PATH = path
         return ds
     return None
 
@@ -1270,7 +1310,9 @@ def _refresh_power_display_energy_dataset() -> None:
     """Drop compact Power display-product handles so latest products reopen."""
     global _POWER_DISPLAY_ENERGY_DS, _POWER_DISPLAY_ENERGY_REFRESHED_AT
     global _POWER_DISPLAY_SUMMARY_DS, _POWER_DISPLAY_SUMMARY_REFRESHED_AT
+    global _POWER_DISPLAY_SUMMARY_SOURCE_PATH
     global _POWER_OPERATING_SCENARIOS_DS, _POWER_OPERATING_SCENARIOS_REFRESHED_AT
+    global _POWER_OPERATING_SCENARIOS_SOURCE_PATH
     if _POWER_DISPLAY_ENERGY_DS is not None:
         try:
             _POWER_DISPLAY_ENERGY_DS.close()
@@ -1285,6 +1327,7 @@ def _refresh_power_display_energy_dataset() -> None:
             pass
     _POWER_DISPLAY_SUMMARY_DS = None
     _POWER_DISPLAY_SUMMARY_REFRESHED_AT = None
+    _POWER_DISPLAY_SUMMARY_SOURCE_PATH = None
     for ds in _POWER_DISPLAY_SECTION_DS.values():
         try:
             ds.close()
@@ -1292,6 +1335,7 @@ def _refresh_power_display_energy_dataset() -> None:
             pass
     _POWER_DISPLAY_SECTION_DS.clear()
     _POWER_DISPLAY_SECTION_REFRESHED_AT.clear()
+    _POWER_DISPLAY_SECTION_SOURCE_PATH.clear()
     if _POWER_OPERATING_SCENARIOS_DS is not None:
         try:
             _POWER_OPERATING_SCENARIOS_DS.close()
@@ -1299,6 +1343,7 @@ def _refresh_power_display_energy_dataset() -> None:
             pass
     _POWER_OPERATING_SCENARIOS_DS = None
     _POWER_OPERATING_SCENARIOS_REFRESHED_AT = None
+    _POWER_OPERATING_SCENARIOS_SOURCE_PATH = None
 
 
 def _open_power_display_energy_window(start, end) -> xr.Dataset | None:

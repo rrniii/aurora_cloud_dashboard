@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Mapping
@@ -183,6 +184,7 @@ LEAD_BUCKETS: tuple[tuple[str, float, float], ...] = (
 )
 ARCHIVE_FORECAST_FIELDS = (
     "BatterySOCForecast",
+    "ForecastSOCBiasCorrectionPctPoints",
     "ECMWFSolarIrradiance",
     "ECMWFSourceIntervalHours",
     "ForecastEffectiveGlobalHorizontalIrradiance",
@@ -246,6 +248,25 @@ FORECAST_IDENTITY_ATTRS = (
     "baseline_control_contract_id",
     "baseline_control_system_version",
     "source_availability_code",
+    "observation_cutoff_utc",
+    "soc_anchor_time_utc",
+    "adaptive_calibration_state_id",
+)
+# Stable, algorithm/configuration identity used to decide which archived rows
+# can share one score surface.  Deliberately exclude per-issue provenance
+# (source cycle/manifest, SOC anchor, observation cutoff) and learned numeric
+# state: those remain in ForecastIdentityID/AdaptiveCalibrationStateID for exact
+# reproducibility, but must not fragment a like-for-like evaluation campaign.
+FORECAST_SEMANTIC_IDENTITY_ARCHIVE_FIELDS = (
+    "ForecastModelContractID",
+    "ForecastSystemVersion",
+    "FeatureSetVersion",
+    "FeatureSetDigest",
+    "ForecastCodeRevision",
+    "CandidateLane",
+    "LocalFeatureContractID",
+    "BaselineControlContractID",
+    "BaselineControlSystemVersion",
 )
 SCENARIO_LOADS_W = (100, 200, 300, 400, 500, 600)
 HINDCAST_LEAD_HOURS = (6, 24, 48, 72)
@@ -260,7 +281,12 @@ def _utc_now() -> str:
 
 
 def solar_calibration_contract_id(base_factor: float, mos_by_bucket: dict[str, float]) -> str:
-    """Return a stable identity shared by every product using this calibration."""
+    """Return the identity of one learned solar calibration state.
+
+    This identifier is intentionally *not* a forecast-model contract.  The
+    fitted factor and lead MOS values change as observations mature, while the
+    algorithm being evaluated remains the same.
+    """
     payload = {
         "schema": 1,
         "base_factor": round(float(base_factor), 8),
@@ -268,6 +294,80 @@ def solar_calibration_contract_id(base_factor: float, mos_by_bucket: dict[str, f
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return f"solar-calibration-v1-{digest}"
+
+
+def legacy_solar_model_contract_id() -> str:
+    """Return a stable semantic contract for the legacy solar algorithm."""
+    payload = {
+        "schema": 1,
+        "solar_model_name": LEGACY_SOLAR_MODEL_NAME,
+        "solar_model_version": LEGACY_SOLAR_MODEL_VERSION,
+        "solar_feature_set_version": LEGACY_SOLAR_FEATURE_SET_VERSION,
+        "calibration_method": "adaptive_scalar_plus_independent_cycle_lead_mos",
+        "power_semantics": "electrical_power_from_ssrd_scalar",
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return f"solar-model-v1-{digest}"
+
+
+def adaptive_calibration_state_id(attrs: Mapping[str, object]) -> str:
+    """Hash learned numeric state separately from the stable model contract."""
+
+    payload = {
+        "schema": 1,
+        "solar_calibration_state_id": _normalise_identity_text(
+            attrs.get("solar_calibration_contract_id")
+        ),
+        "solar_calibration_factor_w_per_wm2": _normalise_identity_text(
+            attrs.get("solar_calibration_factor_w_per_wm2")
+        ),
+        "raw_solar_calibration_factor_w_per_wm2": _normalise_identity_text(
+            attrs.get("raw_solar_calibration_factor_w_per_wm2")
+        ),
+        "solar_mos_factor_by_lead_bucket": _normalise_identity_text(
+            attrs.get("solar_mos_factor_by_lead_bucket")
+        ),
+        "load_bias_correction_w": _normalise_identity_text(
+            attrs.get("load_bias_correction_w")
+        ),
+        "soc_bias_correction_pct_points_by_bucket": _normalise_identity_text(
+            attrs.get("soc_bias_correction_pct_points_by_bucket")
+        ),
+        "load_residual_model_contract_id": _normalise_identity_text(
+            attrs.get("load_residual_model_contract_id")
+        ),
+        "load_residual_model_status": _normalise_identity_text(
+            attrs.get("load_residual_model_status")
+        ),
+        "load_residual_state_digest": _normalise_identity_text(
+            attrs.get("load_residual_state_digest")
+        ),
+        "load_mode_signature": _normalise_identity_text(attrs.get("load_mode_signature")),
+        "load_state_dynamics_signature": _normalise_identity_text(
+            attrs.get("load_state_dynamics_signature")
+        ),
+        "load_mode_registry_digest": hashlib.sha256(
+            _normalise_identity_text(attrs.get("load_mode_registry")).encode("utf-8")
+        ).hexdigest(),
+        "forecast_load_w": _normalise_identity_text(attrs.get("forecast_load_w")),
+        "forecast_load_p10_w": _normalise_identity_text(
+            attrs.get("forecast_load_p10_w")
+        ),
+        "forecast_load_p50_w": _normalise_identity_text(
+            attrs.get("forecast_load_p50_w")
+        ),
+        "forecast_load_p90_w": _normalise_identity_text(
+            attrs.get("forecast_load_p90_w")
+        ),
+        "battery_calibration_sample_count": _normalise_identity_text(
+            attrs.get("battery_calibration_sample_count")
+        ),
+        "battery_calibration_confidence": _normalise_identity_text(
+            attrs.get("battery_calibration_confidence")
+        ),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    return f"adaptive-calibration-v1-{digest}"
 
 
 def _normalise_identity_text(value: object) -> str:
@@ -313,6 +413,14 @@ def forecast_identity_id(attrs: Mapping[str, object]) -> str:
         "source_availability_code": _normalise_identity_text(
             attrs.get("source_availability_code")
         ),
+        "observation_cutoff_utc": _normalise_identity_text(
+            attrs.get("observation_cutoff_utc")
+        ),
+        "soc_anchor_time_utc": _normalise_identity_text(attrs.get("soc_anchor_time_utc")),
+        "soc_anchor_pct": _normalise_identity_text(attrs.get("initial_soc_pct")),
+        "adaptive_calibration_state_id": _normalise_identity_text(
+            attrs.get("adaptive_calibration_state_id")
+        ),
         "initial_soc_time": _normalise_identity_text(attrs.get("initial_soc_time")),
         "input_snapshot_id": _normalise_identity_text(attrs.get("input_snapshot_id")),
     }
@@ -347,6 +455,9 @@ def apply_forecast_identity(
         "baseline_control_contract_id": "",
         "baseline_control_system_version": "",
         "source_availability_code": "",
+        "observation_cutoff_utc": attrs.get("initial_soc_time", ""),
+        "soc_anchor_time_utc": attrs.get("initial_soc_time", ""),
+        "adaptive_calibration_state_id": attrs.get("adaptive_calibration_state_id", ""),
     }
     for name, default in defaults.items():
         attrs[name] = _normalise_identity_text(identity.get(name, default))
@@ -431,6 +542,9 @@ def forecast_publication_signature(forecast: xr.Dataset) -> str:
         ),
         "source_availability_code": str(attrs.get("source_availability_code", "")),
         "forecast_identity_id": str(attrs.get("forecast_identity_id", "")),
+        "adaptive_calibration_state_id": str(
+            attrs.get("adaptive_calibration_state_id", "")
+        ),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
 
@@ -477,7 +591,20 @@ def validate_paired_candidate(candidate: xr.Dataset, baseline: xr.Dataset) -> No
         baseline.attrs.get("forecast_horizon_hours", "")
     ):
         failures.append("forecast_horizon_hours")
-    if str(candidate.attrs.get("ecmwf_input_file", "")) != str(
+    if str(candidate.attrs.get("solar_input_representation", "")) == "embedded_site_irradiance":
+        if str(candidate.attrs.get("site_irradiance_source_manifest_digest", "")) != str(
+            baseline.attrs.get("source_manifest_digest", "")
+        ):
+            failures.append("site irradiance source manifest")
+        if str(candidate.attrs.get("site_irradiance_source_cycle_set_id", "")) != str(
+            baseline.attrs.get("source_cycle_set_id", "")
+        ):
+            failures.append("site irradiance source cycle")
+        if str(candidate.attrs.get("input_snapshot_id", "")) != str(
+            candidate.attrs.get("site_irradiance_sha256", "")
+        ):
+            failures.append("site irradiance snapshot identity")
+    elif str(candidate.attrs.get("ecmwf_input_file", "")) != str(
         baseline.attrs.get("ecmwf_input_file", "")
     ):
         failures.append("ecmwf_input_file")
@@ -550,6 +677,138 @@ def _atomic_write_zarr(ds: xr.Dataset, output_zarr: Path) -> None:
     if output_zarr.exists():
         shutil.rmtree(output_zarr)
     tmp.rename(output_zarr)
+
+
+ISSUE_SNAPSHOT_DIGEST_MARKER = ".aurora-snapshot-content-v1.json"
+ISSUE_SNAPSHOT_DIGEST_ALGORITHM = "sha256-relative-path-nul-content-nul-v1"
+
+
+def _issue_snapshot_tree_digest(path: Path) -> tuple[str, int, int]:
+    """Hash exact persisted Zarr content using the bundle artifact contract."""
+
+    root = Path(path)
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("Issue snapshot is not a direct Zarr directory")
+    files: list[Path] = []
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            raise ValueError("Issue snapshot contains a symbolic link")
+        if not candidate.is_file():
+            continue
+        if candidate.relative_to(root).as_posix() == ISSUE_SNAPSHOT_DIGEST_MARKER:
+            continue
+        files.append(candidate)
+    files.sort(key=lambda candidate: candidate.relative_to(root).as_posix())
+    digest = hashlib.sha256()
+    byte_count = 0
+    for candidate in files:
+        relative = candidate.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with candidate.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                byte_count += len(block)
+                digest.update(block)
+        digest.update(b"\0")
+    return digest.hexdigest(), len(files), byte_count
+
+
+def _verify_issue_snapshot(path: Path, *, expected_signature: str) -> str:
+    """Verify the marker, persisted bytes, and readable dataset signature."""
+
+    marker_path = Path(path) / ISSUE_SNAPSHOT_DIGEST_MARKER
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError("Issue snapshot content-digest marker is missing or invalid") from exc
+    if (
+        marker.get("schemaVersion") != 1
+        or marker.get("digestAlgorithm") != ISSUE_SNAPSHOT_DIGEST_ALGORITHM
+    ):
+        raise ValueError("Issue snapshot content-digest marker has an unsupported contract")
+    expected_digest = str(marker.get("contentDigest") or "")
+    digest, file_count, byte_count = _issue_snapshot_tree_digest(Path(path))
+    if expected_digest != f"sha256:{digest}":
+        raise ValueError("Issue snapshot content digest does not match persisted bytes")
+    if int(marker.get("fileCount", -1)) != file_count or int(
+        marker.get("byteCount", -1)
+    ) != byte_count:
+        raise ValueError("Issue snapshot content-digest counts do not match persisted bytes")
+    marker_signature = str(marker.get("publicationSignature") or "").strip()
+    if marker_signature != expected_signature:
+        raise ValueError("Issue snapshot marker has a different forecast signature")
+    try:
+        with xr.open_zarr(path, chunks={}, consolidated=True) as opened:
+            stored = opened.load()
+    except Exception as exc:
+        raise ValueError("Issue snapshot is unreadable") from exc
+    if str(stored.attrs.get("publication_signature", "")).strip() != expected_signature:
+        raise ValueError("Issue snapshot dataset has a different forecast signature")
+    return digest
+
+
+def write_immutable_issue_snapshot(forecast: xr.Dataset, output_zarr: Path) -> Path:
+    """Write one archive-eligible issue once and reject conflicting reuse.
+
+    The caller chooses the cycle/signature-specific path.  A retry with the
+    same publication signature is idempotent; reusing that path for different
+    forecast content fails closed instead of replacing campaign evidence.
+    """
+
+    path = Path(output_zarr)
+    if path.suffix.lower() != ".zarr":
+        raise ValueError("Issue snapshot path must end in .zarr")
+    if str(forecast.attrs.get("forecast_verification_eligible", "")).lower() != "true":
+        raise ValueError("Only archive-eligible forecast issues may be snapshotted")
+    if str(forecast.attrs.get("forecast_refresh_kind", "")) != "ecmwf_cycle":
+        raise ValueError("Only full ECMWF-cycle forecasts may be snapshotted")
+    signature = str(forecast.attrs.get("publication_signature", "")).strip()
+    if not signature:
+        raise ValueError("Issue snapshot requires a publication signature")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{path.name}.staging-", dir=str(path.parent))
+    )
+    try:
+        chunk_dim = "time" if "time" in forecast.sizes else next(iter(forecast.sizes), None)
+        chunked = (
+            forecast.chunk(
+                {chunk_dim: min(max(forecast.sizes.get(chunk_dim, 1), 1), 288)}
+            )
+            if chunk_dim is not None
+            else forecast
+        )
+        chunked.to_zarr(staging, mode="w", consolidated=True)
+        digest, file_count, byte_count = _issue_snapshot_tree_digest(staging)
+        marker = {
+            "schemaVersion": 1,
+            "digestAlgorithm": ISSUE_SNAPSHOT_DIGEST_ALGORITHM,
+            "contentDigest": f"sha256:{digest}",
+            "fileCount": file_count,
+            "byteCount": byte_count,
+            "publicationSignature": signature,
+        }
+        (staging / ISSUE_SNAPSHOT_DIGEST_MARKER).write_text(
+            json.dumps(marker, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        staged_digest = _verify_issue_snapshot(
+            staging, expected_signature=signature
+        )
+        if not path.exists():
+            try:
+                staging.rename(path)
+                return path
+            except OSError:
+                if not path.exists():
+                    raise
+        existing_digest = _verify_issue_snapshot(path, expected_signature=signature)
+        if existing_digest != staged_digest:
+            raise ValueError("Issue snapshot path already contains a different forecast")
+        return path
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def _load_state(path: Path) -> dict[str, object]:
@@ -731,6 +990,66 @@ def accumulated_irradiance_from_forecast(ds: xr.Dataset, variable: str) -> pd.Se
 def solar_irradiance_from_ssrd(ds: xr.Dataset) -> pd.Series:
     """Convert accumulated ECMWF SSRD J/m2 to interval W/m2."""
     return accumulated_irradiance_from_forecast(ds, "ssrd")
+
+
+SITE_IRRADIANCE_DIGEST_ALGORITHM = "sha256-time-utc-ns-float64-hex-v1"
+
+
+def _normalise_site_irradiance_override(irradiance: pd.Series) -> pd.Series:
+    """Validate an exact site-extracted irradiance trace without resampling it.
+
+    A leading NaN is allowed only for the SOC anchor, which has no preceding
+    forecast interval by convention. Every actual interval endpoint must be
+    finite and non-negative.
+    """
+
+    if not isinstance(irradiance, pd.Series):
+        raise TypeError("site_irradiance_override must be a pandas Series")
+    try:
+        index = pd.DatetimeIndex(irradiance.index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Embedded site irradiance has an invalid time grid") from exc
+    if index.tz is not None:
+        index = index.tz_convert("UTC").tz_localize(None)
+    if len(index) < 2 or index.hasnans:
+        raise ValueError("Embedded site irradiance needs at least two valid UTC times")
+    if index.has_duplicates or not index.is_monotonic_increasing:
+        raise ValueError("Embedded site irradiance time grid must be strictly increasing")
+    values = np.asarray(irradiance.to_numpy(), dtype=np.float64).reshape(-1)
+    if values.size != len(index):
+        raise ValueError("Embedded site irradiance values do not match its time grid")
+    nonfinite = ~np.isfinite(values)
+    if np.any(nonfinite):
+        allowed_anchor = bool(nonfinite[0]) and int(np.count_nonzero(nonfinite)) == 1
+        if not allowed_anchor:
+            raise ValueError(
+                "Embedded site irradiance must be finite except for one leading SOC anchor"
+            )
+    finite = values[np.isfinite(values)]
+    if finite.size < 2:
+        raise ValueError("Embedded site irradiance needs at least two forecast intervals")
+    if np.any(finite < 0.0):
+        raise ValueError("Embedded site irradiance cannot contain negative values")
+    return pd.Series(values, index=index, name="ECMWFSolarIrradiance")
+
+
+def site_irradiance_series_digest(irradiance: pd.Series) -> str:
+    """Return a stable SHA256 for the exact site forcing values and UTC grid."""
+
+    normalised = _normalise_site_irradiance_override(irradiance)
+    payload = {
+        "algorithm": SITE_IRRADIANCE_DIGEST_ALGORITHM,
+        "samples": [
+            [
+                int(timestamp.value),
+                None if not np.isfinite(value) else float(value).hex(),
+            ]
+            for timestamp, value in normalised.items()
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _instantaneous_forecast_series(ds: xr.Dataset, candidates: tuple[str, ...]) -> pd.Series:
@@ -1200,11 +1519,9 @@ def _active_forecast_contract_id(archive: xr.Dataset) -> str | None:
     nonempty = [value for value in values if value and value.lower() != "nan"]
     if not nonempty:
         return None
-    unique = set(nonempty)
-    # Treat historical rows without a contract as the same baseline until a
-    # genuine second non-empty contract appears, preserving ongoing v10 skill.
-    if len(unique) == 1 and len(nonempty) != len(values):
-        return None
+    # Blank legacy identities are never evidence for a newly identified
+    # contract.  Select the newest real contract even when it is the first one
+    # archived, so all downstream score surfaces exclude unidentified rows.
     return nonempty[-1]
 
 
@@ -1223,13 +1540,42 @@ def _active_forecast_system_version(archive: xr.Dataset, contract_id: str | None
 
 
 def _filter_active_forecast_contract(table: pd.DataFrame, archive: xr.Dataset) -> pd.DataFrame:
+    """Keep rows with the newest complete stable semantic forecast identity.
+
+    ``ForecastIdentityID`` and ``AdaptiveCalibrationStateID`` identify one
+    reproducible issue and therefore vary normally across a campaign.  The
+    fields below describe the stable implementation/configuration contract and
+    must all match before deterministic, hindcast, mode-specific, or adaptive
+    learning calculations may pool archived rows.
+    """
     target = _active_forecast_contract_id(archive)
     if target is None or table.empty or "forecast_model_contract_id" not in table:
         return table
     filtered = table[table["forecast_model_contract_id"] == target]
-    system_version = _active_forecast_system_version(archive, target)
-    if system_version is not None and "forecast_system_version" in filtered:
-        filtered = filtered[filtered["forecast_system_version"] == system_version]
+    contracts = np.asarray(archive["ForecastModelContractID"].values, dtype=str).reshape(-1)
+    target_indices = np.flatnonzero(contracts == target)
+    if target_indices.size == 0:
+        return filtered.iloc[0:0]
+    target_index = int(target_indices[-1])
+    table_names = {
+        "ForecastSystemVersion": "forecast_system_version",
+        "FeatureSetVersion": "feature_set_version",
+        "FeatureSetDigest": "feature_set_digest",
+        "ForecastCodeRevision": "forecast_code_revision",
+        "CandidateLane": "candidate_lane",
+        "LocalFeatureContractID": "local_feature_contract_id",
+        "BaselineControlContractID": "baseline_control_contract_id",
+        "BaselineControlSystemVersion": "baseline_control_system_version",
+    }
+    for archive_name in FORECAST_SEMANTIC_IDENTITY_ARCHIVE_FIELDS[1:]:
+        table_name = table_names[archive_name]
+        if archive_name not in archive or table_name not in filtered:
+            # Once a real contract exists, unidentified/incomplete rows must
+            # not silently enter evidence or adaptive state.
+            return filtered.iloc[0:0]
+        values = np.asarray(archive[archive_name].fillna("").values, dtype=str).reshape(-1)
+        target_value = str(values[target_index])
+        filtered = filtered[filtered[table_name].astype(str) == target_value]
     return filtered
 
 
@@ -1567,6 +1913,22 @@ def _archive_verification_frame(
         )
     else:
         mode_learning_ready = np.zeros(len(forecast_values), dtype=bool)
+    if "ForecastVerificationEligible" in archive:
+        verification_eligible = np.repeat(
+            np.asarray(archive["ForecastVerificationEligible"].fillna(False).values, dtype=bool).reshape(-1),
+            int(archive.sizes.get("forecast_step", 0)),
+        )
+    else:
+        # Archives predating the explicit marker contained independent-cycle
+        # rows only, so retain their established evaluation behaviour.
+        verification_eligible = np.ones(len(forecast_values), dtype=bool)
+    if "IndependentCycle" in archive:
+        independent_cycles = np.repeat(
+            np.asarray(archive["IndependentCycle"].fillna(False).values, dtype=bool).reshape(-1),
+            int(archive.sizes.get("forecast_step", 0)),
+        )
+    else:
+        independent_cycles = verification_eligible.copy()
 
     def repeated_text(name: str, default: str = "") -> np.ndarray:
         if name not in archive:
@@ -1581,9 +1943,13 @@ def _archive_verification_frame(
     forecast_system_versions = repeated_text("ForecastSystemVersion")
     feature_set_versions = repeated_text("FeatureSetVersion")
     feature_set_digests = repeated_text("FeatureSetDigest")
+    forecast_code_revisions = repeated_text("ForecastCodeRevision")
     source_cycle_set_ids = repeated_text("SourceCycleSetID")
     degraded_mode_codes = repeated_text("DegradedModeCode")
     candidate_lanes = repeated_text("CandidateLane")
+    local_feature_contract_ids = repeated_text("LocalFeatureContractID")
+    baseline_control_contract_ids = repeated_text("BaselineControlContractID")
+    baseline_control_system_versions = repeated_text("BaselineControlSystemVersion")
     solar_model_names = repeated_text("SolarModelName")
     solar_power_semantics = repeated_text("SolarPowerSemantics")
     if "ECMWFCycleTime" in archive:
@@ -1611,14 +1977,20 @@ def _archive_verification_frame(
     model_versions = model_versions[valid_mask]
     load_modes = load_modes[valid_mask]
     mode_learning_ready = mode_learning_ready[valid_mask]
+    verification_eligible = verification_eligible[valid_mask]
+    independent_cycles = independent_cycles[valid_mask]
     forecast_contracts = forecast_contracts[valid_mask]
     forecast_identity_ids = forecast_identity_ids[valid_mask]
     forecast_system_versions = forecast_system_versions[valid_mask]
     feature_set_versions = feature_set_versions[valid_mask]
     feature_set_digests = feature_set_digests[valid_mask]
+    forecast_code_revisions = forecast_code_revisions[valid_mask]
     source_cycle_set_ids = source_cycle_set_ids[valid_mask]
     degraded_mode_codes = degraded_mode_codes[valid_mask]
     candidate_lanes = candidate_lanes[valid_mask]
+    local_feature_contract_ids = local_feature_contract_ids[valid_mask]
+    baseline_control_contract_ids = baseline_control_contract_ids[valid_mask]
+    baseline_control_system_versions = baseline_control_system_versions[valid_mask]
     solar_model_names = solar_model_names[valid_mask]
     solar_power_semantics = solar_power_semantics[valid_mask]
     lead_hours = lead_hours[valid_mask]
@@ -1634,14 +2006,20 @@ def _archive_verification_frame(
             "load_model_version": model_versions[paired],
             "load_mode": load_modes[paired],
             "load_mode_learning_ready": mode_learning_ready[paired],
+            "forecast_verification_eligible": verification_eligible[paired],
+            "independent_cycle": independent_cycles[paired],
             "forecast_model_contract_id": forecast_contracts[paired],
             "forecast_identity_id": forecast_identity_ids[paired],
             "forecast_system_version": forecast_system_versions[paired],
             "feature_set_version": feature_set_versions[paired],
             "feature_set_digest": feature_set_digests[paired],
+            "forecast_code_revision": forecast_code_revisions[paired],
             "source_cycle_set_id": source_cycle_set_ids[paired],
             "degraded_mode_code": degraded_mode_codes[paired],
             "candidate_lane": candidate_lanes[paired],
+            "local_feature_contract_id": local_feature_contract_ids[paired],
+            "baseline_control_contract_id": baseline_control_contract_ids[paired],
+            "baseline_control_system_version": baseline_control_system_versions[paired],
             "solar_model_name": solar_model_names[paired],
             "solar_power_semantics": solar_power_semantics[paired],
             "valid_time": valid_times[paired],
@@ -1663,10 +2041,38 @@ def _independent_verification_rows(table: pd.DataFrame) -> pd.DataFrame:
     """
     if table.empty:
         return table
-    keys = [name for name in ("cycle_time", "valid_time") if name in table]
-    if not keys:
+    if "forecast_verification_eligible" in table:
+        table = table.loc[table["forecast_verification_eligible"].astype(bool)]
+    if "independent_cycle" in table:
+        table = table.loc[table["independent_cycle"].astype(bool)]
+    if table.empty:
         return table
-    return table.sort_values("issue_time").drop_duplicates(keys, keep="last")
+    if "valid_time" not in table:
+        return table
+    cycle_key = table["cycle_time"].astype(str)
+    if "source_cycle_set_id" in table:
+        source = table["source_cycle_set_id"].astype(str).str.strip()
+        usable = ~source.str.lower().isin({"", "nan", "none"})
+        cycle_key = cycle_key.where(~usable, source)
+    selected = table.copy()
+    selected["_independent_cycle_key"] = cycle_key
+    return selected.sort_values("issue_time").drop_duplicates(
+        ["_independent_cycle_key", "valid_time"], keep="last"
+    )
+
+
+def _verification_cycle_count(table: pd.DataFrame) -> int:
+    """Count immutable source-cycle sets, falling back for legacy archives."""
+    if table.empty:
+        return 0
+    if "_independent_cycle_key" in table:
+        return int(table["_independent_cycle_key"].nunique())
+    if "source_cycle_set_id" in table:
+        values = table["source_cycle_set_id"].astype(str).str.strip()
+        values = values.loc[~values.str.lower().isin({"", "nan", "none"})]
+        if not values.empty:
+            return int(values.nunique())
+    return int(table["cycle_time"].nunique())
 
 
 def _add_error_metrics(metrics: dict[str, float | int | str], prefix: str, errors: np.ndarray, lead_hours: np.ndarray) -> None:
@@ -1693,19 +2099,21 @@ def evaluate_forecast_archive(archive: xr.Dataset | None, frame: pd.DataFrame) -
         return {}
     metrics: dict[str, float | int | str] = {}
     tolerance = pd.Timedelta(minutes=10)
-    active_contract = _active_forecast_contract_id(archive)
-    active_system_version = _active_forecast_system_version(archive, active_contract)
     if "BatterySOC" in frame:
-        errors, lead_hours = _errors_for_archive_variable(
+        soc_table = _archive_verification_frame(
             archive,
-            frame,
+            frame["BatterySOC"],
             forecast_var="BatterySOCForecast",
-            observed=frame["BatterySOC"],
             tolerance=tolerance,
-            forecast_model_contract_id=active_contract,
-            forecast_system_version=active_system_version,
         )
-        _add_error_metrics(metrics, "soc", errors, lead_hours)
+        soc_table = _filter_active_forecast_contract(soc_table, archive)
+        if not soc_table.empty:
+            _add_error_metrics(
+                metrics,
+                "soc",
+                soc_table["error"].to_numpy(dtype=np.float64),
+                soc_table["lead_hour"].to_numpy(dtype=np.float64),
+            )
     observed_solar = _observed_solar_w(frame)
     if not observed_solar.empty:
         solar_table = _archive_verification_frame(
@@ -1735,17 +2143,24 @@ def evaluate_forecast_archive(archive: xr.Dataset | None, frame: pd.DataFrame) -
             )
     observed_load = _observed_load_w(frame)
     if not observed_load.empty:
-        errors, lead_hours = _errors_for_archive_variable(
+        load_table = _archive_verification_frame(
             archive,
-            frame,
+            observed_load,
             forecast_var="ForecastLoadWatts",
-            observed=observed_load,
             tolerance=tolerance,
-            load_model_version=LOAD_MODEL_VERSION,
-            forecast_model_contract_id=active_contract,
-            forecast_system_version=active_system_version,
         )
-        _add_error_metrics(metrics, "load", errors, lead_hours)
+        load_table = _filter_active_forecast_contract(load_table, archive)
+        if not load_table.empty:
+            load_table = load_table[
+                load_table["load_model_version"] == float(LOAD_MODEL_VERSION)
+            ]
+        if not load_table.empty:
+            _add_error_metrics(
+                metrics,
+                "load",
+                load_table["error"].to_numpy(dtype=np.float64),
+                load_table["lead_hour"].to_numpy(dtype=np.float64),
+            )
     if metrics:
         aliases = {
             "soc_mae_pct_points": "soc_mae",
@@ -1819,7 +2234,7 @@ def evaluate_independent_forecast_archive(archive: xr.Dataset | None, frame: pd.
             table["error"].to_numpy(dtype=np.float64),
             table["lead_hour"].to_numpy(dtype=np.float64),
         )
-        metrics[f"{name}_independent_cycles"] = int(table["cycle_time"].nunique())
+        metrics[f"{name}_independent_cycles"] = _verification_cycle_count(table)
 
     if "BatterySOC" in frame:
         score("soc", "BatterySOCForecast", frame["BatterySOC"])
@@ -2044,7 +2459,9 @@ def build_forecast_skill_dataset(
                 soc[(soc["valid_time"] > window_start) & (soc["valid_time"] <= now)]
             )
             columns["ForecastVerificationSamples"][idx] = float(len(selected))
-            columns["ForecastIndependentCycles"][idx] = float(selected["cycle_time"].nunique())
+            columns["ForecastIndependentCycles"][idx] = float(
+                _verification_cycle_count(selected)
+            )
             for bucket, start_hour, end_hour in LEAD_BUCKETS:
                 bucketed = selected[(selected["lead_hour"] >= start_hour) & (selected["lead_hour"] < end_hour)]
                 mae, bias, _rmse, ref_mae, _skill, _sample_float, sample_count = _rolling_error_stats(
@@ -2055,7 +2472,9 @@ def build_forecast_skill_dataset(
                     columns[f"ForecastSOCMAE_{bucket}_Verified"][idx] = mae
                     columns[f"ForecastSOCBias_{bucket}_Verified"][idx] = bias
                     columns[f"ForecastSOCMAESamples_{bucket}"][idx] = float(sample_count)
-                    columns[f"ForecastSOCMAECycles_{bucket}"][idx] = float(bucketed["cycle_time"].nunique())
+                    columns[f"ForecastSOCMAECycles_{bucket}"][idx] = float(
+                        _verification_cycle_count(bucketed)
+                    )
                     columns[f"ForecastSOCSkill_{bucket}"][idx] = _guarded_skill(
                         mae, ref_mae, minimum_reference_mae=0.5
                     )
@@ -2063,7 +2482,8 @@ def build_forecast_skill_dataset(
                         mae <= FORECAST_TARGET_MAE_PCT_POINTS
                         and abs(bias) <= FORECAST_TARGET_MAE_PCT_POINTS
                         and sample_count >= FORECAST_TARGET_MIN_SAMPLES
-                        and bucketed["cycle_time"].nunique() >= FORECAST_TARGET_MIN_CYCLES
+                        and _verification_cycle_count(bucketed)
+                        >= FORECAST_TARGET_MIN_CYCLES
                     )
                     if bucket == "0_6h":
                         columns["ForecastSOCBias_0_6h_Verified"][idx] = bias
@@ -2079,7 +2499,7 @@ def build_forecast_skill_dataset(
                     )
                     if mode_count < 2:
                         continue
-                    cycles = int(mode_rows["cycle_time"].nunique())
+                    cycles = _verification_cycle_count(mode_rows)
                     mode_mae[idx, mode_index, LEAD_BUCKETS.index((bucket, start_hour, end_hour))] = mode_mae_value
                     mode_bias[idx, mode_index, LEAD_BUCKETS.index((bucket, start_hour, end_hour))] = mode_bias_value
                     mode_samples[idx, mode_index, LEAD_BUCKETS.index((bucket, start_hour, end_hour))] = float(mode_count)
@@ -2103,7 +2523,9 @@ def build_forecast_skill_dataset(
                 columns["ForecastLoadMAE24h"][idx] = mae
                 columns["ForecastLoadBias24h"][idx] = bias
                 columns["ForecastLoadVerificationSamples"][idx] = float(sample_count)
-                columns["ForecastLoadIndependentCycles"][idx] = float(selected["cycle_time"].nunique())
+                columns["ForecastLoadIndependentCycles"][idx] = float(
+                    _verification_cycle_count(selected)
+                )
                 columns["ForecastLoadSkill24h"][idx] = _guarded_skill(
                     mae, ref_mae, minimum_reference_mae=5.0
                 )
@@ -2120,7 +2542,9 @@ def build_forecast_skill_dataset(
                 columns["ForecastSolarMAE24h"][idx] = mae
                 columns["ForecastSolarBias24h"][idx] = bias
                 columns["ForecastSolarVerificationSamples"][idx] = float(sample_count)
-                columns["ForecastSolarIndependentCycles"][idx] = float(selected["cycle_time"].nunique())
+                columns["ForecastSolarIndependentCycles"][idx] = float(
+                    _verification_cycle_count(selected)
+                )
                 columns["ForecastSolarSkill24h"][idx] = _guarded_skill(
                     mae, ref_mae, minimum_reference_mae=5.0
                 )
@@ -2219,6 +2643,39 @@ def _archive_row_from_forecast(forecast: xr.Dataset) -> xr.Dataset:
         ("issue_time",),
         np.array([forecast.attrs.get("load_mode_learning_ready", "false") == "true"], dtype=bool),
     )
+    data_vars["ForecastRefreshKind"] = (
+        ("issue_time",),
+        np.asarray([str(forecast.attrs.get("forecast_refresh_kind", "unknown"))], dtype="U32"),
+    )
+    default_independent = str(
+        forecast.attrs.get("forecast_refresh_kind", "ecmwf_cycle")
+    ) != "cached_reanchor"
+    data_vars["ForecastVerificationEligible"] = (
+        ("issue_time",),
+        np.asarray(
+            [
+                str(
+                    forecast.attrs.get(
+                        "forecast_verification_eligible", str(default_independent)
+                    )
+                ).lower()
+                == "true"
+            ],
+            dtype=bool,
+        ),
+    )
+    data_vars["IndependentCycle"] = (
+        ("issue_time",),
+        np.asarray(
+            [
+                str(
+                    forecast.attrs.get("independent_cycle", str(default_independent))
+                ).lower()
+                == "true"
+            ],
+            dtype=bool,
+        ),
+    )
     provenance_fields = {
         "ForecastModelName": "forecast_model_name",
         "ForecastModelVersion": "forecast_model_version",
@@ -2237,6 +2694,10 @@ def _archive_row_from_forecast(forecast: xr.Dataset) -> xr.Dataset:
         "BaselineControlContractID": "baseline_control_contract_id",
         "BaselineControlSystemVersion": "baseline_control_system_version",
         "SourceAvailabilityCode": "source_availability_code",
+        "ObservationCutoffUTC": "observation_cutoff_utc",
+        "SOCAuthoringAnchorTimeUTC": "soc_anchor_time_utc",
+        "SOCAuthoringAnchorPct": "initial_soc_pct",
+        "AdaptiveCalibrationStateID": "adaptive_calibration_state_id",
         "SolarModelName": "solar_model_name",
         "SolarModelVersion": "solar_model_version",
         "SolarModelContractID": "solar_model_contract_id",
@@ -2287,6 +2748,7 @@ def build_soc_hindcast_dataset(
         tolerance=pd.Timedelta(minutes=10),
     )
     records = _filter_active_forecast_contract(records, archive)
+    records = _independent_verification_rows(records)
     series: list[pd.Series] = [observed.rename("BatterySOCObservedHindcast")]
     if records.empty:
         records = pd.DataFrame(columns=("valid_time", "lead_hour", "issue_time", "forecast_value"))
@@ -2445,22 +2907,186 @@ def _apply_soc_bias_corrections(
     corrections: dict[str, float],
     *,
     issue_time: pd.Timestamp,
+    parasitic_load_w: float = 0.0,
 ) -> pd.DataFrame:
-    if not corrections or "BatterySOCForecast" not in forecast:
+    """Apply a continuous residual by attenuating physical SOC increments only.
+
+    Historical code added one constant offset inside each lead bucket.  That
+    created artificial jumps at 6, 24 and 48 hours, including SOC increases at
+    night while the battery was supplying load.  Here each bucket value is a
+    continuous target, but it may only reduce the magnitude of an independently
+    integrated physical increment.  It cannot reverse energy direction, create
+    a change during zero flow, or exceed the integrated increment magnitude.
+    """
+    if "BatterySOCForecast" not in forecast:
         return forecast
     out = forecast.copy()
     lead_hours = (pd.DatetimeIndex(out.index) - pd.Timestamp(issue_time)) / pd.Timedelta(hours=1)
-    initial_soc = float(out["BatterySOCForecast"].iloc[0])
-    soc = out["BatterySOCForecast"].to_numpy(dtype=np.float64).copy()
-    for bucket, start, end in LEAD_BUCKETS:
-        correction = float(corrections.get(bucket, 0.0))
-        if correction == 0.0:
-            continue
-        mask = (lead_hours >= start) & (lead_hours < end)
-        soc[mask] = np.clip(soc[mask] + correction, 0.0, 100.0)
-    soc[0] = initial_soc
+    raw_soc = out["BatterySOCForecast"].to_numpy(dtype=np.float64).copy()
+    if not len(raw_soc):
+        return out
+    knot_hours = [0.0]
+    knot_values = [0.0]
+    carried = 0.0
+    for bucket, _start, end in LEAD_BUCKETS:
+        try:
+            value = float(corrections.get(bucket, carried))
+        except (TypeError, ValueError):
+            value = carried
+        if not np.isfinite(value):
+            value = carried
+        carried = float(np.clip(value, -DEFAULT_SOC_BIAS_CORRECTION_LIMIT, DEFAULT_SOC_BIAS_CORRECTION_LIMIT))
+        knot_hours.append(float(end))
+        knot_values.append(carried)
+    correction_curve = np.interp(
+        np.asarray(lead_hours, dtype=np.float64),
+        np.asarray(knot_hours, dtype=np.float64),
+        np.asarray(knot_values, dtype=np.float64),
+        left=0.0,
+        right=carried,
+    )
+    tentative = np.clip(raw_soc + correction_curve, 0.0, 100.0)
+    soc = np.empty_like(raw_soc)
+    soc[0] = raw_soc[0]
+    solar = (
+        out["ForecastSolarWatts"].to_numpy(dtype=np.float64)
+        if "ForecastSolarWatts" in out
+        else np.full(len(out), np.nan)
+    )
+    load = (
+        out["ForecastLoadWatts"].to_numpy(dtype=np.float64)
+        if "ForecastLoadWatts" in out
+        else np.full(len(out), np.nan)
+    )
+    charge = (
+        out["ForecastBatteryChargeInputWatts"].to_numpy(dtype=np.float64)
+        if "ForecastBatteryChargeInputWatts" in out
+        else np.full(len(out), np.nan)
+    )
+    discharge = (
+        out["ForecastBatteryDischargeOutputWatts"].to_numpy(dtype=np.float64)
+        if "ForecastBatteryDischargeOutputWatts" in out
+        else np.full(len(out), np.nan)
+    )
+    for index in range(1, len(soc)):
+        direction = _battery_flow_direction(
+            charge[index],
+            discharge[index],
+            solar[index],
+            load[index],
+            parasitic_load_w=parasitic_load_w,
+        )
+        raw_delta = float(raw_soc[index] - raw_soc[index - 1])
+        if direction is None:
+            direction = 1 if raw_delta > 1.0e-9 else -1 if raw_delta < -1.0e-9 else 0
+        desired_delta = float(tentative[index] - soc[index - 1])
+        if direction > 0 and raw_delta >= -1.0e-9:
+            corrected_delta = float(np.clip(desired_delta, 0.0, max(raw_delta, 0.0)))
+            soc[index] = soc[index - 1] + corrected_delta
+        elif direction < 0 and raw_delta <= 1.0e-9:
+            corrected_delta = float(np.clip(desired_delta, min(raw_delta, 0.0), 0.0))
+            soc[index] = soc[index - 1] + corrected_delta
+        elif direction == 0 and abs(raw_delta) <= 1.0e-9:
+            soc[index] = soc[index - 1]
+        else:
+            # Preserve a contradictory integrated interval unchanged so the
+            # validator below fails closed rather than concealing bad inputs.
+            soc[index] = raw_soc[index]
+        soc[index] = float(np.clip(soc[index], 0.0, 100.0))
     out["BatterySOCForecast"] = soc
+    out["ForecastSOCBiasCorrectionPctPoints"] = soc - raw_soc
     return out
+
+
+def _battery_flow_direction(
+    charge: float,
+    discharge: float,
+    solar: float,
+    load: float,
+    *,
+    parasitic_load_w: float = 0.0,
+    tolerance: float = 1.0e-6,
+) -> int | None:
+    """Return +1 charge, -1 discharge, 0 balanced, or None if unknown."""
+
+    if np.isfinite(charge) and np.isfinite(discharge):
+        net = float(charge - discharge)
+    elif np.isfinite(solar) and np.isfinite(load):
+        parasitic = float(parasitic_load_w) if np.isfinite(parasitic_load_w) else 0.0
+        net = float(solar - load - max(parasitic, 0.0))
+    else:
+        return None
+    if net > tolerance:
+        return 1
+    if net < -tolerance:
+        return -1
+    return 0
+
+
+def validate_soc_physical_consistency(
+    forecast: pd.DataFrame,
+    *,
+    parasitic_load_w: float = 0.0,
+) -> None:
+    """Fail closed when SOC direction contradicts interval-average energy flow."""
+
+    if "BatterySOCForecast" not in forecast or len(forecast) < 2:
+        return
+    soc = forecast["BatterySOCForecast"].to_numpy(dtype=np.float64)
+    if not np.isfinite(soc).all() or np.any(soc < -1.0e-6) or np.any(soc > 100.0 + 1.0e-6):
+        raise ValueError("SOC forecast is non-finite or outside physical bounds")
+    solar = (
+        forecast["ForecastSolarWatts"].to_numpy(dtype=np.float64)
+        if "ForecastSolarWatts" in forecast
+        else np.full(len(forecast), np.nan)
+    )
+    load = (
+        forecast["ForecastLoadWatts"].to_numpy(dtype=np.float64)
+        if "ForecastLoadWatts" in forecast
+        else np.full(len(forecast), np.nan)
+    )
+    charge = (
+        forecast["ForecastBatteryChargeInputWatts"].to_numpy(dtype=np.float64)
+        if "ForecastBatteryChargeInputWatts" in forecast
+        else np.full(len(forecast), np.nan)
+    )
+    discharge = (
+        forecast["ForecastBatteryDischargeOutputWatts"].to_numpy(dtype=np.float64)
+        if "ForecastBatteryDischargeOutputWatts" in forecast
+        else np.full(len(forecast), np.nan)
+    )
+    deltas = np.diff(soc)
+    directions = np.asarray(
+        [
+            _battery_flow_direction(
+                charge[index],
+                discharge[index],
+                solar[index],
+                load[index],
+                parasitic_load_w=parasitic_load_w,
+            )
+            for index in range(1, len(soc))
+        ],
+        dtype=object,
+    )
+    known = np.asarray([value is not None for value in directions], dtype=bool)
+    numeric_direction = np.asarray(
+        [0 if value is None else int(value) for value in directions], dtype=np.int8
+    )
+    invalid_rise = known & (deltas > 1.0e-6) & (numeric_direction <= 0)
+    invalid_fall = known & (deltas < -1.0e-6) & (numeric_direction >= 0)
+    if np.any(invalid_rise):
+        raise ValueError("SOC forecast rises without a net-charging interval")
+    if np.any(invalid_fall):
+        raise ValueError("SOC forecast falls without a net-discharging interval")
+    if "ForecastSOCBiasCorrectionPctPoints" in forecast:
+        correction = forecast["ForecastSOCBiasCorrectionPctPoints"].to_numpy(
+            dtype=np.float64
+        )
+        physical_soc = soc - correction
+        physical_deltas = np.diff(physical_soc)
+        if np.any(np.abs(deltas) > np.abs(physical_deltas) + 1.0e-6):
+            raise ValueError("SOC residual exceeds the physically integrated increment")
 
 
 def calibrate_solar_factor(
@@ -2523,6 +3149,7 @@ def calibrated_solar_factor_profile(
             forecast_var="ForecastSolarWatts",
             tolerance=pd.Timedelta(minutes=10),
         )
+        table = _filter_active_forecast_contract(table, archive)
         table = _independent_verification_rows(table)
         if not table.empty:
             for bucket, start, stop in LEAD_BUCKETS:
@@ -2897,6 +3524,7 @@ def _apply_candidate_load_residual(
         return profile, {
             "load_residual_model_status": "not_requested",
             "load_residual_model_contract_id": "",
+            "load_residual_state_digest": "",
             "load_residual_training_samples": 0,
             "load_residual_physical_floor_w": floor,
             "load_residual_physical_floor_source": str(physical_floor_source),
@@ -2909,9 +3537,23 @@ def _apply_candidate_load_residual(
     p90 = np.maximum(np.asarray(profile.p90_w, dtype=np.float64) + p90_correction, floor)
     p10 = np.minimum(p10, p50)
     p90 = np.maximum(p90, p50)
+    residual_state_payload = {
+        "schema": 1,
+        "p10_correction_w": np.round(p10_correction, 8).tolist(),
+        "p50_correction_w": np.round(p50_correction, 8).tolist(),
+        "p90_correction_w": np.round(p90_correction, 8).tolist(),
+        "training_samples": int(residual.get("training_samples", 0) or 0),
+        "training_cycles": int(residual.get("training_cycles", 0) or 0),
+        "training_days": int(residual.get("training_days", 0) or 0),
+        "selection": _normalise_identity_text(residual.get("selection", "")),
+    }
     diagnostics = {
         "load_residual_model_status": _normalise_identity_text(residual.get("status", "unknown")),
         "load_residual_model_contract_id": _normalise_identity_text(residual.get("contract_id", "")),
+        "load_residual_state_digest": "sha256:"
+        + hashlib.sha256(
+            json.dumps(residual_state_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
         "load_residual_training_samples": int(residual.get("training_samples", 0) or 0),
         "load_residual_training_cycles": int(residual.get("training_cycles", 0) or 0),
         "load_residual_training_days": int(residual.get("training_days", 0) or 0),
@@ -2951,6 +3593,7 @@ def build_forecast_dataset(
     fixed_soc_bias_corrections: dict[str, float] | None = None,
     load_residual_profile: Mapping[str, object] | None = None,
     fixed_legacy_solar_w: pd.Series | None = None,
+    site_irradiance_override: pd.Series | None = None,
 ) -> xr.Dataset:
     selected_solar_model = validate_solar_model(solar_model)
     if fixed_legacy_solar_w is not None and selected_solar_model != LEGACY_SOLAR_MODEL_NAME:
@@ -2971,12 +3614,26 @@ def build_forecast_dataset(
     previous_metrics = evaluate_independent_forecast_archive(forecast_archive, frame)
     if not previous_metrics:
         previous_metrics = evaluate_previous_forecast(previous_forecast, frame)
-    irradiance = solar_irradiance_from_ssrd(solar)
-    if irradiance.empty:
-        raise ValueError("No ECMWF solar forecast samples could be converted from ssrd")
+    embedded_site_forcing = site_irradiance_override is not None
+    if embedded_site_forcing:
+        irradiance = _normalise_site_irradiance_override(site_irradiance_override)
+        if pd.Timestamp(irradiance.index[0]) != pd.Timestamp(latest_time):
+            raise ValueError(
+                "Embedded site irradiance must begin on the exact SOC anchor time"
+            )
+        if not np.isfinite(float(irradiance.iloc[0])):
+            irradiance = irradiance.iloc[1:]
+    else:
+        irradiance = solar_irradiance_from_ssrd(solar)
+        if irradiance.empty:
+            raise ValueError("No ECMWF solar forecast samples could be converted from ssrd")
     horizon_end = latest_time + pd.Timedelta(hours=horizon_hours)
     irradiance = irradiance[(irradiance.index >= latest_time) & (irradiance.index <= horizon_end)]
     irradiance, solar_tail_extension_hours = _extend_irradiance_with_diurnal_persistence(irradiance, horizon_end)
+    if embedded_site_forcing and solar_tail_extension_hours > 0.0:
+        raise ValueError(
+            "Embedded site irradiance does not cover the complete paired forecast horizon"
+        )
     if len(irradiance) < 2:
         raise ValueError("ECMWF solar forecast does not overlap the requested SOC forecast horizon")
 
@@ -3009,7 +3666,8 @@ def build_forecast_dataset(
             pd.DatetimeIndex(irradiance.index),
             issue_time=latest_time,
         )
-        solar_contract_id = solar_calibration_contract_id(factor, solar_mos_by_bucket)
+        solar_calibration_id = solar_calibration_contract_id(factor, solar_mos_by_bucket)
+        solar_contract_id = legacy_solar_model_contract_id()
         solar_metadata: dict[str, object] = {
             "solar_model_name": LEGACY_SOLAR_MODEL_NAME,
             "solar_model_version": str(LEGACY_SOLAR_MODEL_VERSION),
@@ -3046,6 +3704,7 @@ def build_forecast_dataset(
         if physical_solar_frame.empty or physical_solar_substeps.empty:
             raise ValueError("Physical solar model produced no forecast samples")
         solar_contract_id = str(solar_metadata["solar_model_contract_id"])
+        solar_calibration_id = "physical-residual-calibration-disabled"
         solar_metadata.update(
             {
                 "solar_model_status": "candidate",
@@ -3273,8 +3932,33 @@ def build_forecast_dataset(
                 capacity_kwh=battery_model.usable_capacity_kwh,
                 battery_model=battery_model,
             )
-            scenario = scenario_substeps.reindex(forecast.index)
+            scenario = _aggregate_physical_soc_forecast(
+                scenario_substeps,
+                physical_solar_frame,
+                irradiance,
+                pd.DatetimeIndex(forecast.index),
+            )
         forecast[scenario_soc_field(scenario_load_w)] = scenario["BatterySOCForecast"]
+        scenario_for_validation = pd.DataFrame(
+            {
+                "BatterySOCForecast": scenario["BatterySOCForecast"],
+                "ForecastSolarWatts": scenario["ForecastSolarWatts"],
+                "ForecastLoadWatts": scenario["ForecastLoadWatts"],
+            },
+            index=scenario.index,
+        )
+        if "ForecastBatteryDischargeOutputWatts" in scenario:
+            scenario_for_validation["ForecastBatteryDischargeOutputWatts"] = scenario[
+                "ForecastBatteryDischargeOutputWatts"
+            ]
+        if "ForecastBatteryChargeInputWatts" in scenario:
+            scenario_for_validation["ForecastBatteryChargeInputWatts"] = scenario[
+                "ForecastBatteryChargeInputWatts"
+            ]
+        validate_soc_physical_consistency(
+            scenario_for_validation,
+            parasitic_load_w=battery_model.parasitic_load_w,
+        )
     if fixed_soc_bias_corrections is None:
         soc_bias_corrections = _soc_bias_corrections(
             state.get("soc_bias_correction_pct_points_by_bucket"),
@@ -3287,7 +3971,16 @@ def build_forecast_dataset(
             {},
             alpha=0.0,
         )
-    forecast = _apply_soc_bias_corrections(forecast, soc_bias_corrections, issue_time=latest_time)
+    forecast = _apply_soc_bias_corrections(
+        forecast,
+        soc_bias_corrections,
+        issue_time=latest_time,
+        parasitic_load_w=battery_model.parasitic_load_w,
+    )
+    validate_soc_physical_consistency(
+        forecast,
+        parasitic_load_w=battery_model.parasitic_load_w,
+    )
     soc_mae = float(previous_metrics.get("soc_mae_pct_points", np.nan))
     solar_mae = float(previous_metrics.get("solar_mae_w", np.nan))
     load_mae = float(previous_metrics.get("load_mae_w", np.nan))
@@ -3367,7 +4060,9 @@ def build_forecast_dataset(
                 if physical_candidate
                 else "calibrated_ssrd_scalar"
             ),
-            "solar_calibration_contract_id": solar_contract_id,
+            # Compatibility: this historical attribute name now correctly
+            # identifies learned calibration state, not the solar algorithm.
+            "solar_calibration_contract_id": solar_calibration_id,
             "solar_observation_censoring_status": (
                 "uncurtailed_samples_unavailable_register_791_not_archived"
                 if physical_candidate
@@ -3381,6 +4076,8 @@ def build_forecast_dataset(
             "raw_forecast_load_w": f"{raw_load_w:.6g}",
             "load_bias_correction_w": f"{load_bias_correction:.6g}",
             "soc_bias_correction_pct_points_by_bucket": json.dumps(soc_bias_corrections, sort_keys=True),
+            "soc_bias_correction_method": "continuous_energy_direction_preserving_attenuation_v3",
+            "soc_physical_consistency_status": "passed",
             "load_model": LOAD_MODEL_NAME,
             "load_model_version": str(LOAD_MODEL_VERSION),
             "load_state_contract": CONTROLLED_LOAD_CONTRACT,
@@ -3412,6 +4109,9 @@ def build_forecast_dataset(
             "load_anchor_method": str(load_diagnostics.get("load_anchor_method", "unknown")),
             "load_residual_model_status": str(load_diagnostics.get("load_residual_model_status", "not_requested")),
             "load_residual_model_contract_id": str(load_diagnostics.get("load_residual_model_contract_id", "")),
+            "load_residual_state_digest": str(
+                load_diagnostics.get("load_residual_state_digest", "")
+            ),
             "load_residual_training_samples": str(int(load_diagnostics.get("load_residual_training_samples", 0))),
             "load_residual_training_cycles": str(int(load_diagnostics.get("load_residual_training_cycles", 0))),
             "load_residual_training_days": str(int(load_diagnostics.get("load_residual_training_days", 0))),
@@ -3440,6 +4140,8 @@ def build_forecast_dataset(
         },
     )
     out["BatterySOCForecast"].attrs["units"] = "%"
+    if "ForecastSOCBiasCorrectionPctPoints" in out:
+        out["ForecastSOCBiasCorrectionPctPoints"].attrs["units"] = "percentage points"
     for scenario_load_w in SCENARIO_LOADS_W:
         field = scenario_soc_field(scenario_load_w)
         out[field].attrs["units"] = "%"
@@ -3527,6 +4229,7 @@ def build_forecast_dataset(
     out["ForecastLoadBiasRecent"].attrs["units"] = "W"
     out["ForecastEvaluationSamples"].attrs["units"] = "samples"
     out["ForecastSkillSampleCount"].attrs["units"] = "samples"
+    out.attrs["adaptive_calibration_state_id"] = adaptive_calibration_state_id(out.attrs)
     return out
 
 
@@ -3565,9 +4268,56 @@ def generate(
     reference_forecast_archive: xr.Dataset | None = None,
     fixed_soc_bias_corrections_override: dict[str, float] | None = None,
     fixed_legacy_solar_w: pd.Series | None = None,
+    issue_snapshot_zarr: Path | None = None,
+    site_irradiance_override: pd.Series | None = None,
+    site_irradiance_provenance: Mapping[str, object] | None = None,
 ) -> Path:
     provider = validate_provider(provider)
     selected_solar_model = validate_solar_model(solar_model)
+    embedded_site_forcing = site_irradiance_override is not None
+    if embedded_site_forcing != (site_irradiance_provenance is not None):
+        raise ValueError(
+            "site_irradiance_override and site_irradiance_provenance must be supplied together"
+        )
+    normalised_site_irradiance: pd.Series | None = None
+    site_irradiance_digest = ""
+    site_provenance: dict[str, object] = {}
+    site_cycle_time: pd.Timestamp | None = None
+    if embedded_site_forcing:
+        if input_forecast is not None or refresh_from_cache:
+            raise ValueError(
+                "Embedded site irradiance cannot be combined with a GRIB input or cache refresh"
+            )
+        normalised_site_irradiance = _normalise_site_irradiance_override(
+            site_irradiance_override
+        )
+        site_irradiance_digest = site_irradiance_series_digest(
+            normalised_site_irradiance
+        )
+        site_provenance = {
+            str(name): value for name, value in dict(site_irradiance_provenance or {}).items()
+        }
+        expected_site_digest = str(
+            site_provenance.get("site_irradiance_sha256", "")
+        ).strip().lower()
+        if expected_site_digest != f"sha256:{site_irradiance_digest}":
+            raise ValueError("Embedded site irradiance checksum does not match its provenance")
+        baseline_source_digest = str(
+            site_provenance.get("source_manifest_digest", "")
+        ).strip().lower()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", baseline_source_digest):
+            raise ValueError("Embedded site irradiance lacks source-manifest digest provenance")
+        source_cycle_set = str(site_provenance.get("source_cycle_set_id", "")).strip()
+        if not source_cycle_set or source_cycle_set.lower() in {"nan", "none"}:
+            raise ValueError("Embedded site irradiance lacks source-cycle provenance")
+        site_cycle_time = pd.to_datetime(
+            site_provenance.get("source_cycle_time_utc"), utc=True, errors="coerce"
+        )
+        if pd.isna(site_cycle_time):
+            raise ValueError("Embedded site irradiance lacks a valid source-cycle time")
+        site_cycle_time = pd.Timestamp(site_cycle_time).tz_convert("UTC").tz_localize(None)
+        if str(input_snapshot_id or "").strip().lower() != f"sha256:{site_irradiance_digest}":
+            raise ValueError("input_snapshot_id does not identify the embedded site irradiance")
     if selected_solar_model == PHYSICAL_SOLAR_MODEL_NAME:
         protected = {
             "latest forecast": POWER_SOC_FORECAST_ZARR_PATH,
@@ -3612,7 +4362,7 @@ def generate(
         if physical_solar_config_digest(physical_solar_config) != expected_config_digest:
             raise ValueError("Physical solar configuration checksum changed before generation")
     retrieval_diagnostics: dict[str, object] = {}
-    if input_forecast is None:
+    if input_forecast is None and not embedded_site_forcing:
         if refresh_from_cache:
             input_forecast = _latest_cached_forecast(cache_dir)
         else:
@@ -3674,14 +4424,51 @@ def generate(
                 )
         except Exception:
             pdu = None
-    provider_result = open_provider_solar_forecast(
-        input_forecast,
-        provider=provider,
-        latitude=latitude,
-        longitude=longitude,
-        shadow_report_path=shadow_report_path,
-    )
-    solar = provider_result.dataset
+    if embedded_site_forcing:
+        assert site_cycle_time is not None
+        solar = xr.Dataset(
+            coords={"forecast_reference_time": site_cycle_time.to_datetime64()},
+            attrs={
+                name: site_provenance[name]
+                for name in (
+                    "selected_grid_latitude",
+                    "selected_grid_longitude",
+                    "selected_grid_distance_km",
+                )
+                if name in site_provenance
+            },
+        )
+        provider_diagnostics: dict[str, object] = {
+            "requested_provider": provider,
+            "effective_provider": str(
+                site_provenance.get("ecmwf_provider_effective", provider)
+            ),
+            "fallback_reason": "",
+            "input_representation": "embedded_site_irradiance",
+            "site_irradiance_sha256": f"sha256:{site_irradiance_digest}",
+            "global_grid_opened": False,
+        }
+        input_label = "embedded:ECMWFSolarIrradiance"
+        input_digest = site_irradiance_digest
+        input_digest_available = True
+    else:
+        assert input_forecast is not None
+        provider_result = open_provider_solar_forecast(
+            input_forecast,
+            provider=provider,
+            latitude=latitude,
+            longitude=longitude,
+            shadow_report_path=shadow_report_path,
+        )
+        solar = provider_result.dataset
+        provider_diagnostics = dict(provider_result.diagnostics)
+        input_label = str(input_forecast)
+        input_digest_available = input_forecast.is_file()
+        input_digest = (
+            _sha256_file(input_forecast)
+            if input_digest_available
+            else hashlib.sha256(f"unavailable:{input_forecast}".encode("utf-8")).hexdigest()
+        )
     previous_forecast = None
     if output_zarr.exists():
         try:
@@ -3725,8 +4512,25 @@ def generate(
         fixed_soc_bias_corrections=fixed_soc_bias_corrections,
         load_residual_profile=load_residual_profile,
         fixed_legacy_solar_w=fixed_legacy_solar_w,
+        site_irradiance_override=normalised_site_irradiance,
     )
-    forecast.attrs["ecmwf_input_file"] = str(input_forecast)
+    forecast.attrs["ecmwf_input_file"] = input_label
+    forecast.attrs["solar_input_representation"] = (
+        "embedded_site_irradiance" if embedded_site_forcing else "provider_forecast_file"
+    )
+    forecast.attrs["site_irradiance_sha256"] = (
+        f"sha256:{site_irradiance_digest}" if embedded_site_forcing else ""
+    )
+    forecast.attrs["site_irradiance_source_manifest_digest"] = (
+        str(site_provenance.get("source_manifest_digest", ""))
+        if embedded_site_forcing
+        else ""
+    )
+    forecast.attrs["site_irradiance_source_cycle_set_id"] = (
+        str(site_provenance.get("source_cycle_set_id", ""))
+        if embedded_site_forcing
+        else ""
+    )
     forecast.attrs["site_latitude"] = str(float(latitude))
     forecast.attrs["site_longitude"] = str(float(longitude))
     forecast.attrs["refresh_from_cache"] = str(bool(refresh_from_cache)).lower()
@@ -3745,23 +4549,43 @@ def generate(
         if pair_reference is not None
         else ""
     )
-    # Cached ECMWF refreshes deliberately re-anchor the live SOC and learned
-    # load after a mode transition. They are not independent ECMWF forecast
-    # issues and must not create duplicate archive/skill samples.
+    # Cached ECMWF refreshes deliberately re-anchor live SOC/load after a mode
+    # transition. They remain auditable archive rows but are explicitly marked
+    # ineligible for independent skill, hindcast, or adaptive-learning inputs.
+    # Archive retention and evaluation eligibility are separate contracts.
+    # Cached re-anchors are operationally meaningful audit samples, but they
+    # share weather forcing and must never tune or certify the forecast.
     if archive_forecast is None:
-        archive_forecast = not refresh_from_cache
+        archive_forecast = True
+    independent_cycle = not refresh_from_cache
+    if issue_snapshot_zarr is not None:
+        issue_snapshot_zarr = Path(issue_snapshot_zarr)
+        if not archive_forecast or not independent_cycle:
+            raise ValueError(
+                "Issue snapshots require an archive-eligible full ECMWF-cycle forecast"
+            )
+        protected_outputs = tuple(
+            Path(path)
+            for path in (output_zarr, archive_zarr, skill_zarr, hindcast_zarr, state_path)
+            if path is not None
+        )
+        if any(_paths_overlap(issue_snapshot_zarr, path) for path in protected_outputs):
+            raise ValueError("Issue snapshot path overlaps a mutable forecast product")
     input_age_minutes = float(
         (pd.Timestamp(datetime.now(timezone.utc)).tz_localize(None) - latest_power_time)
         / pd.Timedelta(minutes=1)
     )
-    forecast.attrs["forecast_refresh_kind"] = "ecmwf_cycle" if archive_forecast else "cached_reanchor"
-    forecast.attrs["forecast_verification_eligible"] = str(bool(archive_forecast)).lower()
+    forecast.attrs["forecast_refresh_kind"] = (
+        "ecmwf_cycle" if independent_cycle else "cached_reanchor"
+    )
+    forecast.attrs["forecast_verification_eligible"] = str(independent_cycle).lower()
+    forecast.attrs["independent_cycle"] = str(independent_cycle).lower()
     forecast.attrs["input_power_age_minutes"] = f"{max(input_age_minutes, 0.0):.6g}"
     forecast.attrs["ecmwf_provider_requested"] = provider
-    forecast.attrs["ecmwf_provider_effective"] = str(provider_result.diagnostics["effective_provider"])
-    forecast.attrs["ecmwf_provider_fallback_reason"] = str(provider_result.diagnostics.get("fallback_reason", ""))
+    forecast.attrs["ecmwf_provider_effective"] = str(provider_diagnostics["effective_provider"])
+    forecast.attrs["ecmwf_provider_fallback_reason"] = str(provider_diagnostics.get("fallback_reason", ""))
     forecast.attrs["ecmwf_provider_diagnostics"] = json.dumps(
-        {**retrieval_diagnostics, **provider_result.diagnostics}, sort_keys=True
+        {**retrieval_diagnostics, **provider_diagnostics}, sort_keys=True
     )
     for name in ("selected_grid_latitude", "selected_grid_longitude", "selected_grid_distance_km"):
         if name in solar.attrs:
@@ -3769,13 +4593,76 @@ def generate(
     cycle_time = _ecmwf_cycle_time(solar)
     if cycle_time is not None:
         forecast.attrs["ecmwf_cycle_time"] = cycle_time.isoformat()
-    apply_forecast_identity(forecast, forecast_identity)
+    effective_provider = str(provider_diagnostics["effective_provider"])
+    cycle_text = cycle_time.isoformat() if cycle_time is not None else "unknown"
+    stable_feature_payload = {
+        "schema": 1,
+        "solar_feature_set_version": str(
+            forecast.attrs.get("solar_feature_set_version", "")
+        ),
+        "load_model": str(forecast.attrs.get("load_model", "")),
+        "load_model_version": str(forecast.attrs.get("load_model_version", "")),
+        "load_state_contract": str(forecast.attrs.get("load_state_contract", "")),
+        "battery_energy_model": "bounded_bidirectional_efficiency_v1",
+    }
+    default_identity = {
+        "forecast_system_version": f"power-v{forecast.attrs.get('forecast_model_version', 'unknown')}",
+        "feature_set_version": "+".join(
+            value
+            for value in (
+                str(forecast.attrs.get("solar_feature_set_version", "")),
+                str(forecast.attrs.get("load_state_contract", "")),
+            )
+            if value
+        ),
+        "feature_set_digest": hashlib.sha256(
+            json.dumps(stable_feature_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "training_cutoff_utc": latest_power_time.isoformat(),
+        "observation_cutoff_utc": latest_power_time.isoformat(),
+        "soc_anchor_time_utc": str(forecast.attrs.get("initial_soc_time", "")),
+        "forecast_code_revision": os.environ.get(
+            "AURORA_FORECAST_CODE_REVISION", "unversioned"
+        ).strip()
+        or "unversioned",
+        "source_cycle_set_id": (
+            str(site_provenance["source_cycle_set_id"])
+            if embedded_site_forcing
+            else f"ecmwf:{effective_provider}:{cycle_text}:sha256:{input_digest[:20]}"
+        ),
+        "source_manifest_digest": (
+            str(site_provenance["source_manifest_digest"])
+            if embedded_site_forcing
+            else f"sha256:{input_digest}"
+        ),
+        "degraded_mode_code": "+".join(
+            (
+                *(
+                    ("ecmwf_provider_fallback",)
+                    if str(provider_diagnostics.get("fallback_reason", "")).strip()
+                    else ()
+                ),
+                *(("source_checksum_unavailable",) if not input_digest_available else ()),
+            )
+        )
+        or "none",
+        "adaptive_calibration_state_id": str(
+            forecast.attrs.get("adaptive_calibration_state_id", "")
+        ),
+    }
+    if forecast_identity is not None:
+        default_identity.update(
+            {str(name): value for name, value in forecast_identity.items()}
+        )
+    apply_forecast_identity(forecast, default_identity)
     forecast.attrs["publication_signature"] = forecast_publication_signature(forecast)
     if pair_reference is not None:
         if not forecast.attrs["evaluation_pair_id"] or not forecast.attrs["input_snapshot_id"]:
             raise ValueError("Paired physical candidate requires evaluation_pair_id and input_snapshot_id")
         validate_paired_candidate(forecast, pair_reference)
     if expected_input_sha256 is not None:
+        if embedded_site_forcing:
+            raise ValueError("expected_input_sha256 is valid only for a file-backed forecast input")
         expected_digest = str(expected_input_sha256).strip().lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
             raise ValueError("expected_input_sha256 must be a 64-character hexadecimal digest")
@@ -3790,6 +4677,8 @@ def generate(
     )
     if not unchanged_publication:
         _atomic_write_zarr(forecast, output_zarr)
+    if issue_snapshot_zarr is not None:
+        write_immutable_issue_snapshot(forecast, issue_snapshot_zarr)
     if archive_forecast:
         updated_archive = (
             forecast_archive
@@ -3842,15 +4731,16 @@ def generate(
                 forecast.attrs["soc_bias_correction_pct_points_by_bucket"]
             ),
             "latest_metrics": json.loads(forecast.attrs["previous_forecast_metrics"]),
-            "latest_ecmwf_input_file": str(input_forecast),
+            "latest_ecmwf_input_file": input_label,
             "latest_refresh_from_cache": bool(refresh_from_cache),
             "latest_forecast_refresh_kind": forecast.attrs["forecast_refresh_kind"],
-            "latest_forecast_verification_eligible": bool(archive_forecast),
+            "latest_forecast_verification_eligible": bool(independent_cycle),
+            "latest_independent_cycle": bool(independent_cycle),
             "latest_input_power_time": latest_power_time.isoformat(),
             "latest_input_power_age_minutes": max(input_age_minutes, 0.0),
             "latest_ecmwf_provider_requested": provider,
-            "latest_ecmwf_provider_effective": provider_result.diagnostics["effective_provider"],
-            "latest_ecmwf_provider_fallback_reason": provider_result.diagnostics.get("fallback_reason", ""),
+            "latest_ecmwf_provider_effective": provider_diagnostics["effective_provider"],
+            "latest_ecmwf_provider_fallback_reason": provider_diagnostics.get("fallback_reason", ""),
             "solar_model_name": forecast.attrs["solar_model_name"],
             "solar_model_version": int(forecast.attrs["solar_model_version"]),
             "solar_model_contract_id": forecast.attrs["solar_model_contract_id"],
@@ -3901,7 +4791,7 @@ def main() -> None:
     parser.add_argument(
         "--no-archive-forecast",
         action="store_true",
-        help="Publish a re-anchored forecast without adding a verification archive issue",
+        help="Publish without retaining an operational audit row in the forecast archive",
     )
     parser.add_argument(
         "--max-power-age-minutes",
@@ -3928,6 +4818,14 @@ def main() -> None:
         help="Versioned array geometry/electrical config used only by the physical candidate",
     )
     parser.add_argument("--shadow-report", type=Path, default=DEFAULT_SHADOW_REPORT_PATH)
+    parser.add_argument(
+        "--issue-snapshot-zarr",
+        type=Path,
+        help=(
+            "Write this full archive-eligible issue once at a cycle/signature-specific "
+            "path for downstream paired evaluation"
+        ),
+    )
     args = parser.parse_args()
     generate(
         power_zarr=args.power_zarr,
@@ -3950,6 +4848,7 @@ def main() -> None:
         archive_forecast=False if args.no_archive_forecast else None,
         solar_model=args.solar_model,
         physical_solar_config_path=args.solar_physical_config,
+        issue_snapshot_zarr=args.issue_snapshot_zarr,
     )
 
 

@@ -52,6 +52,7 @@ SOLAR_MPP_MODE_FIELDS = (
     "SolarMPPMode_West",
 )
 MPP_ACTIVE_MODE = 2.0
+PAIR_ARTIFACT_DIGEST_ALGORITHM = "sha256-relative-path-nul-content-nul-v1"
 
 
 def utc_now_iso() -> str:
@@ -60,6 +61,84 @@ def utc_now_iso() -> str:
 
 def stable_json_digest(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def immutable_artifact_record(path: Path, *, relative_path: str) -> dict[str, object]:
+    """Return a deterministic, symlink-free content record for one artifact."""
+
+    root = Path(path)
+    if not root.exists() or root.is_symlink():
+        raise ValueError(f"Immutable pair artifact is missing or symbolic: {root}")
+    if root.is_file():
+        files = [root]
+    else:
+        descendants = list(root.rglob("*"))
+        if any(candidate.is_symlink() for candidate in descendants):
+            raise ValueError(f"Immutable pair artifact contains a symbolic link: {root}")
+        files = sorted(
+            (candidate for candidate in descendants if candidate.is_file()),
+            key=lambda candidate: candidate.relative_to(root).as_posix(),
+        )
+    if not files:
+        raise ValueError(f"Immutable pair artifact is empty: {root}")
+    digest = hashlib.sha256()
+    byte_count = 0
+    for candidate in files:
+        if candidate.is_symlink():
+            raise ValueError(f"Immutable pair artifact contains a symbolic link: {candidate}")
+        relative = candidate.name if root.is_file() else candidate.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with candidate.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                byte_count += len(block)
+                digest.update(block)
+        digest.update(b"\0")
+    return {
+        "relative_path": str(relative_path),
+        "sha256": f"sha256:{digest.hexdigest()}",
+        "file_count": len(files),
+        "byte_count": byte_count,
+    }
+
+
+def pair_artifacts_valid(
+    manifest: Mapping[str, object],
+    bundle: Path,
+    required: Mapping[str, str],
+) -> bool:
+    """Fail closed unless every named immutable pair artifact still matches."""
+
+    if manifest.get("artifact_digest_algorithm") != PAIR_ARTIFACT_DIGEST_ALGORITHM:
+        return False
+    checksums = manifest.get("artifact_checksums")
+    if not isinstance(checksums, Mapping):
+        return False
+    bundle = Path(bundle)
+    if bundle.is_symlink():
+        return False
+    try:
+        bundle_root = bundle.resolve(strict=True)
+    except OSError:
+        return False
+    for logical_name, relative_path in required.items():
+        record = checksums.get(logical_name)
+        if not isinstance(record, Mapping):
+            return False
+        if str(record.get("relative_path") or "") != relative_path:
+            return False
+        target = bundle / relative_path
+        try:
+            resolved = target.resolve(strict=True)
+            if resolved.parent != bundle_root:
+                return False
+            actual = immutable_artifact_record(target, relative_path=relative_path)
+        except (OSError, ValueError):
+            return False
+        for field in ("sha256", "file_count", "byte_count"):
+            if record.get(field) != actual[field]:
+                return False
+    return True
 
 
 def _as_utc_naive(value: object) -> pd.Timestamp:
@@ -332,18 +411,16 @@ def fit_bounded_load_residual(
     cycles = int(rows["cycle_time"].nunique()) if not rows.empty else 0
     days = int(rows["valid_time"].dt.floor("D").nunique()) if not rows.empty else 0
     zero = pd.Series(np.zeros(len(times), dtype=np.float64), index=times)
-    contracts = (
-        sorted({str(value) for value in rows.get("forecast_model_contract_id", []) if str(value)})
-        if not rows.empty
-        else []
-    )
     payload = {
         "schema": 1,
         "name": LOAD_RESIDUAL_MODEL_NAME,
         "bound_w": float(bound_w),
         "feature_columns": ["intercept", "lead", "lead_squared", "utc_hour_sin", "utc_hour_cos"],
-        "load_mode": str(load_mode),
-        "source_contracts": contracts,
+        # The current operating mode and learned coefficients are adaptive
+        # issue state, not changes to the residual-model algorithm. Keeping
+        # them out of this contract allows one campaign cohort to contain the
+        # multiple operating states required by the promotion gate.
+        "load_mode_conditioning": "exact_issue_load_mode",
         "control_forecast_model_contract_id": str(control_forecast_model_contract_id or ""),
         "control_forecast_system_version": str(
             control_forecast_system_version or "unversioned_control"
@@ -471,6 +548,8 @@ def v12_forecast_identity(
             power_history_days=power_history_days,
         ),
         "training_cutoff_utc": _as_utc_naive(issue_time).isoformat(),
+        "observation_cutoff_utc": _as_utc_naive(issue_time).isoformat(),
+        "soc_anchor_time_utc": _as_utc_naive(issue_time).isoformat(),
         "forecast_code_revision": str(code_revision),
         "source_cycle_set_id": str(source_cycle_set_id),
         "source_manifest_digest": str(source_manifest_digest),
@@ -502,9 +581,14 @@ def completed_pair_bundles(pairs_root: Path) -> list[tuple[dict[str, object], Pa
                 continue
             if manifest.get("pair_status") != "complete":
                 continue
-            if not (bundle / "baseline_forecast.zarr").exists() or not (
-                bundle / "candidate_forecast.zarr"
-            ).exists():
+            if not pair_artifacts_valid(
+                manifest,
+                bundle,
+                {
+                    "baseline": "baseline_forecast.zarr",
+                    "candidate": "candidate_forecast.zarr",
+                },
+            ):
                 continue
             bundles.append((manifest, bundle))
     return bundles
@@ -557,6 +641,20 @@ def _irradiance_regime(value: float) -> str:
     return "high_irradiance"
 
 
+def _clearness_cloud_regime(ghi: float, clearness_index: float) -> str:
+    """Classify cloud only when an issue-time clearness index is available."""
+
+    if not np.isfinite(ghi) or ghi <= 1.0:
+        return "dark"
+    if not np.isfinite(clearness_index):
+        return "unknown"
+    if clearness_index >= 0.65:
+        return "clear"
+    if clearness_index <= 0.35:
+        return "cloudy"
+    return "transitional"
+
+
 def build_campaign_evidence(
     pairs_root: Path,
     power: xr.Dataset,
@@ -593,6 +691,10 @@ def build_campaign_evidence(
         if not np.array_equal(times.to_numpy(dtype="datetime64[ns]"), np.asarray(baseline["time"].values)):
             continue
         issue = _as_utc_naive(candidate.attrs.get("initial_soc_time", times[0]))
+        cycle_time = _as_utc_naive(candidate.attrs.get("ecmwf_cycle_time", issue.floor("3h")))
+        source_cycle_id = _pair_text(candidate, "source_cycle_set_id").strip()
+        if not source_cycle_id:
+            source_cycle_id = "ecmwf-cycle:" + cycle_time.isoformat()
         lead_hours = (times - issue) / pd.Timedelta(hours=1)
         candidate_soc = np.asarray(candidate.get("BatterySOCForecast", xr.DataArray(np.full(len(times), np.nan))).values, dtype=np.float64)
         baseline_soc = np.asarray(baseline.get("BatterySOCForecast", xr.DataArray(np.full(len(times), np.nan))).values, dtype=np.float64)
@@ -609,12 +711,17 @@ def build_campaign_evidence(
             candidate.get(forcing_name, xr.DataArray(np.full(len(times), np.nan))).values,
             dtype=np.float64,
         )
-        cloud_regime_method = _pair_text(
-            candidate,
-            "cloud_regime_proxy_method",
-            "ecmwf_ghi_proxy_not_delayed_cloud_product"
-            if forcing_name == "ECMWFSolarIrradiance"
-            else "source_ghi_proxy_not_delayed_cloud_product",
+        clearness = np.asarray(
+            candidate.get(
+                "ECMWFClearnessIndex",
+                xr.DataArray(np.full(len(times), np.nan)),
+            ).values,
+            dtype=np.float64,
+        )
+        cloud_regime_method = (
+            "issue_time_ecmwf_clearness_index_thresholds_v1"
+            if "ECMWFClearnessIndex" in candidate
+            else "unavailable_no_issue_time_clearness_index"
         )
         observed_soc_values = observed_soc.reindex(
             times, method="nearest", tolerance=pd.Timedelta(minutes=10)
@@ -648,10 +755,14 @@ def build_campaign_evidence(
                     "BaselineControlContractID": _pair_text(candidate, "baseline_control_contract_id"),
                     "BaselineControlSystemVersion": _pair_text(candidate, "baseline_control_system_version"),
                     "LocalFeatureContractID": _pair_text(candidate, "local_feature_contract_id"),
-                    "SourceCycleSetID": _pair_text(candidate, "source_cycle_set_id"),
+                    "SourceCycleSetID": source_cycle_id,
+                    "ECMWFCycleTime": cycle_time.to_datetime64(),
                     "LoadMode": _pair_text(candidate, "load_mode", "unknown"),
-                    "CloudRegime": _irradiance_regime(float(ghi[index])),
+                    "CloudRegime": _clearness_cloud_regime(
+                        float(ghi[index]), float(clearness[index])
+                    ),
                     "CloudRegimeMethod": cloud_regime_method,
+                    "ECMWFClearnessIndex": float(clearness[index]),
                     "SourceAvailability": _pair_text(
                         candidate,
                         "source_availability_code",
@@ -687,6 +798,25 @@ def build_campaign_evidence(
                 "incompatible_pair_count": int(incompatible_pair_count),
             },
         )
+    # Retries and cached re-anchors remain auditable operational samples, but
+    # only the latest exact pair for each source-cycle/valid-time key may
+    # contribute to independent campaign scores or promotion gates.
+    records.sort(
+        key=lambda value: (
+            np.datetime64(value["IssueTime"]),
+            np.datetime64(value["ValidTime"]),
+            str(value["EvaluationPairID"]),
+        )
+    )
+    selected_by_cycle_valid: dict[tuple[str, int], int] = {}
+    for index, record in enumerate(records):
+        valid_ns = int(np.datetime64(record["ValidTime"], "ns").astype(np.int64))
+        selected_by_cycle_valid[(str(record["SourceCycleSetID"]), valid_ns)] = index
+    independent_indices = set(selected_by_cycle_valid.values())
+    for index, record in enumerate(records):
+        record["IndependentEvaluationSample"] = index in independent_indices
+        record["SOCAnchorTime"] = record["IssueTime"]
+    duplicate_pair_rows = len(records) - len(independent_indices)
     columns = {name: [record[name] for record in records] for name in records[0]}
     data_vars: dict[str, tuple[tuple[str], np.ndarray]] = {}
     for name, values in columns.items():
@@ -709,11 +839,24 @@ def build_campaign_evidence(
             "evidence_status": "complete_pair_bundles_materialised",
             "evaluation_contract": json.dumps(dict(evaluation_contract or {}), sort_keys=True),
             "incompatible_pair_count": int(incompatible_pair_count),
+            "duplicate_cycle_valid_rows_discarded": 0,
+            "duplicate_cycle_valid_rows_retained": int(duplicate_pair_rows),
             "solar_metric_status": "mpp_active_available_power_only",
             "ensemble_metric_status": "not_generated_in_bounded_initial_candidate",
             "reserve_event_status": "insufficient_events",
         },
     )
+
+
+def _independent_cycle_count(rows: pd.DataFrame) -> int:
+    if rows.empty:
+        return 0
+    if "SourceCycleSetID" in rows:
+        values = rows["SourceCycleSetID"].astype(str).str.strip()
+        values = values.loc[~values.str.lower().isin({"", "nan", "none"})]
+        if not values.empty:
+            return int(values.nunique())
+    return int(rows["IssueTime"].nunique()) if "IssueTime" in rows else 0
 
 
 def _metric_summary(rows: pd.DataFrame) -> dict[str, float | int | str]:
@@ -728,7 +871,7 @@ def _metric_summary(rows: pd.DataFrame) -> dict[str, float | int | str]:
     return {
         "status": "evidence" if len(rows) >= 2 else "diagnostic_sparse",
         "samples": int(len(rows)),
-        "cycles": int(rows["IssueTime"].nunique()),
+        "cycles": _independent_cycle_count(rows),
         "utc_days": int(pd.DatetimeIndex(rows["IssueTime"]).floor("D").nunique()),
         "candidate_soc_mae": candidate_mae,
         "candidate_soc_bias": float(np.mean(candidate_error)),
@@ -762,11 +905,11 @@ def _solar_metric_summary(rows: pd.DataFrame) -> dict[str, float | int | str]:
         return {
             "status": "insufficient_mpp_active_available_power_evidence",
             "samples": int(len(eligible)),
-            "cycles": int(eligible["IssueTime"].nunique()) if "IssueTime" in eligible else 0,
+            "cycles": _independent_cycle_count(eligible),
         }
     return {
         **metrics,
-        "cycles": int(eligible["IssueTime"].nunique()),
+        "cycles": _independent_cycle_count(eligible),
         "status": "evidence" if len(eligible) >= 2 else "diagnostic_sparse",
     }
 
@@ -802,6 +945,11 @@ def campaign_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
     frame["ValidTime"] = pd.to_datetime(frame["ValidTime"])
     frame["IssueTime"] = pd.to_datetime(frame["IssueTime"])
     available = frame.loc[frame["EvaluationAvailable"].astype(bool)].copy()
+    independent = (
+        available.loc[available["IndependentEvaluationSample"].astype(bool)].copy()
+        if "IndependentEvaluationSample" in available
+        else available
+    )
     latest = available["ValidTime"].max() if not available.empty else pd.NaT
 
     def surface(selected: pd.DataFrame) -> dict[str, object]:
@@ -815,7 +963,7 @@ def campaign_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
             if field not in selected:
                 continue
             for value, group in selected.groupby(field, dropna=False):
-                cycles = int(group["IssueTime"].nunique())
+                cycles = _independent_cycle_count(group)
                 strata[f"{field}:{value}"] = {
                     "samples": int(len(group)),
                     "cycles": cycles,
@@ -835,7 +983,7 @@ def campaign_score_surfaces(evidence: xr.Dataset) -> dict[str, object]:
     )
     return {
         "generated_at_utc": utc_now_iso(),
-        "campaign_evidence": surface(available),
+        "campaign_evidence": surface(independent),
         "daily_diagnostic": surface(daily),
         "solar": "mpp_active_available_power_only",
         "ensemble": "not_generated_in_bounded_initial_candidate",
@@ -871,6 +1019,40 @@ def _error_metrics(
         "mae_improvement_fraction": (
             float(1.0 - candidate_mae / baseline_mae) if baseline_mae > 0.0 else 0.0
         ),
+    }
+
+
+def _promotion_diversity(rows: pd.DataFrame) -> dict[str, object]:
+    """Return fail-closed weather/load diversity for one lead bucket."""
+
+    regimes = set()
+    if "CloudRegime" in rows:
+        regimes = {
+            str(value).strip().lower()
+            for value in rows["CloudRegime"]
+            if str(value).strip().lower() not in {"", "nan", "none", "unknown"}
+        }
+    modes = set()
+    if "LoadMode" in rows:
+        modes = {
+            str(value).strip()
+            for value in rows["LoadMode"]
+            if str(value).strip().lower()
+            not in {"", "nan", "none", "unknown", "unavailable", "unspecified"}
+        }
+    clear_covered = "clear" in regimes
+    cloudy_covered = "cloudy" in regimes
+    multiple_modes = len({value.lower() for value in modes}) >= 2
+    eligible = clear_covered and cloudy_covered and multiple_modes
+    return {
+        "status": "eligible" if eligible else "insufficient_diversity",
+        "eligible": eligible,
+        "clear_covered": clear_covered,
+        "cloudy_covered": cloudy_covered,
+        "cloud_regimes": sorted(regimes),
+        "operating_state_count": len({value.lower() for value in modes}),
+        "operating_states": sorted(modes),
+        "required_operating_state_count": 2,
     }
 
 
@@ -911,6 +1093,8 @@ def promotion_gate_review(
         base["evidence"] = "insufficient_evidence"
         return base
     frame = frame.loc[frame["EvaluationAvailable"].astype(bool)].copy()
+    if "IndependentEvaluationSample" in frame:
+        frame = frame.loc[frame["IndependentEvaluationSample"].astype(bool)].copy()
     if frame.empty:
         base["evidence"] = "no_matured_observations"
         return base
@@ -919,13 +1103,23 @@ def promotion_gate_review(
     evidence_ready = True
     for label, start, end in LEAD_BUCKETS:
         rows = frame.loc[(frame["LeadHours"] >= start) & (frame["LeadHours"] < end)]
-        cycles = int(rows["IssueTime"].nunique())
+        cycles = _independent_cycle_count(rows)
         days = int(rows["IssueTime"].dt.floor("D").nunique())
-        eligible = cycles >= 30 and days >= 10
+        diversity = _promotion_diversity(rows)
+        sample_count_eligible = cycles >= 30 and days >= 10
+        eligible = sample_count_eligible and bool(diversity["eligible"])
         lead_gates[label] = {
             "cycles": cycles,
             "utc_days": days,
-            "status": "eligible" if eligible else "insufficient_evidence",
+            "sample_count_eligible": sample_count_eligible,
+            "diversity": diversity,
+            "status": (
+                "eligible"
+                if eligible
+                else "insufficient_diversity"
+                if sample_count_eligible
+                else "insufficient_evidence"
+            ),
         }
         evidence_ready &= eligible
     base["independent_evidence"] = lead_gates
