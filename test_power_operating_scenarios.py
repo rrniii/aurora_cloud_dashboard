@@ -1393,7 +1393,10 @@ class OperatingScenarioTests(unittest.TestCase):
     def test_generator_persists_versioned_state_scenarios_and_recommendation(self) -> None:
         power, pdu = _training_data()
         issue = pd.Timestamp(power["time"].values[-1])
-        deterministic, ensemble = _forecast_inputs(issue)
+        # Production keeps a 240-hour safety tail while publishing a 96-hour
+        # decision.  Exercise that asymmetric contract so a full-tail CL61
+        # count cannot be presented as the 96-hour recommendation.
+        deterministic, ensemble = _forecast_inputs(issue, horizon_hours=240)
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = {
@@ -1424,7 +1427,7 @@ class OperatingScenarioTests(unittest.TestCase):
                 model_state=paths["model"],
                 bootstrap_state=None,
                 recommendation_archive=paths["recommendations"],
-                planning_hours=96,
+                planning_hours=240,
                 optimization_hours=96,
                 lookback_days=2,
                 automation_intent_output=paths["automation_intent"],
@@ -1439,6 +1442,13 @@ class OperatingScenarioTests(unittest.TestCase):
                 self.assertEqual(state.attrs["model_version"], "11")
                 self.assertEqual(scenarios.attrs["control_authority"], "advisory_only")
                 self.assertIn("optimized_cl61", set(str(value) for value in scenarios["scenario"].values))
+                instrument_hours = json.loads(
+                    scenarios.attrs["optimized_instrument_hours"]
+                )
+                self.assertEqual(
+                    float(scenarios.attrs["optimized_collection_hours"]),
+                    float(instrument_hours["CL61"]),
+                )
                 scenario_ids = [str(value) for value in scenarios["scenario"].values]
                 scenario_labels = [str(value) for value in scenarios["scenario_label"].values]
                 for definition in SUGGESTED_OPERATING_SCENARIOS:
@@ -1495,6 +1505,14 @@ class OperatingScenarioTests(unittest.TestCase):
             self.assertEqual(record["instrument_priority"], ["CL61", "Radar", "HATPRO"])
             self.assertEqual(set(record["instrument_hours"]), {"CL61", "Radar", "HATPRO"})
             self.assertEqual(set(record["instrument_starts"]), {"CL61", "Radar", "HATPRO"})
+            self.assertEqual(
+                float(record["collection_hours"]),
+                float(record["instrument_hours"]["CL61"]),
+            )
+            self.assertAlmostEqual(
+                float(record["total_instrument_hours"]),
+                sum(float(value) for value in record["instrument_hours"].values()),
+            )
             self.assertEqual(record["minimum_run_hours"], 12.0)
             self.assertEqual(record["maximum_starts_per_utc_day"], 1)
             self.assertIn(record["recommendation_status"], {"safe_schedule", "reserve_only"})
@@ -1508,16 +1526,23 @@ class OperatingScenarioTests(unittest.TestCase):
                 record["p50_continuation"]["scenario_id"],
                 SCENARIO_P50_CONTINUATION,
             )
+            expected_decision_points = record["decision_horizon_hours"] + 1
             self.assertEqual(
                 len(record["forecast_trace"]["p50_continuation_mode_code"]),
-                96,
+                expected_decision_points,
             )
             self.assertEqual(
                 len(record["forecast_trace"]["p50_continuation_soc_p50_pct"]),
-                96,
+                expected_decision_points,
             )
-            self.assertEqual(len(record["forecast_trace"]["time_utc"]), 96)
-            self.assertEqual(len(record["forecast_trace"]["soc_p50_pct"]), 96)
+            self.assertEqual(
+                len(record["forecast_trace"]["time_utc"]),
+                expected_decision_points,
+            )
+            self.assertEqual(
+                len(record["forecast_trace"]["soc_p50_pct"]),
+                expected_decision_points,
+            )
             self.assertTrue(record["recommended_mode_windows"])
             verification = record["verification"]
             self.assertIsNotNone(verification)

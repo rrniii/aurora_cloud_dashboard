@@ -61,6 +61,9 @@ POWER_DISPLAY_ENERGY_FREQ = os.environ.get("AURORA_POWER_DISPLAY_ENERGY_FREQ", "
 POWER_DISPLAY_SUMMARY_FREQ = os.environ.get("AURORA_POWER_DISPLAY_SUMMARY_FREQ", POWER_DISPLAY_ENERGY_FREQ)
 POWER_DISPLAY_ENERGY_ATTR = "power_display_energy_product"
 POWER_DISPLAY_SUMMARY_ATTR = "power_display_summary_product"
+POWER_FORECAST_DISPLAY_HOURS = float(
+    os.environ.get("AURORA_POWER_FORECAST_DISPLAY_HOURS", "96")
+)
 POWER_SOC_PROJECTION_HOURS = float(os.environ.get("AURORA_POWER_SOC_PROJECTION_HOURS", "24"))
 POWER_SOC_PROJECTION_STEP_MINUTES = float(os.environ.get("AURORA_POWER_SOC_PROJECTION_STEP_MINUTES", "5"))
 POWER_SOC_PROJECTION_POLY_DEGREE = int(os.environ.get("AURORA_POWER_SOC_PROJECTION_POLY_DEGREE", "1"))
@@ -379,6 +382,7 @@ class PanelSpec:
     right_axis_label: str | None
     traces: tuple[TraceSpec, ...]
     description: str | None = None
+    display_horizon_hours: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1784,11 +1788,12 @@ SUMMARY_LAYOUTS: dict[str, tuple[PanelSpec, ...]] = {
             "SOC [%]",
             f"Probability SOC Below {MINIMUM_OPERATIONAL_SOC_LABEL} [%]",
             (
-                TraceSpec("SystemAsIsDecisionSOCP10", "System as-is - P10", COLOR["light_blue"], valid_min=0.0, valid_max=100.0),
-                TraceSpec("SystemAsIsDecisionSOCP90", "System as-is - P90", COLOR["light_blue"], dash="dot", valid_min=0.0, valid_max=100.0),
-                TraceSpec("SystemAsIsDecisionSOCP50", "System as-is - central", COLOR["green"], valid_min=0.0, valid_max=100.0),
+                TraceSpec("SystemAsIsDecisionSOCP10", "System as-is - P10", COLOR["blue"], dash="dash", valid_min=0.0, valid_max=100.0, line_width=2.2),
+                TraceSpec("SystemAsIsDecisionSOCP90", "System as-is - P90", COLOR["light_blue"], dash="dot", valid_min=0.0, valid_max=100.0, line_width=2.2),
+                TraceSpec("SystemAsIsDecisionSOCP50", "System as-is - central", COLOR["green"], valid_min=0.0, valid_max=100.0, line_width=3.0),
                 TraceSpec("SystemAsIsDecisionBelow40Probability", f"Probability Below {MINIMUM_OPERATIONAL_SOC_LABEL}", COLOR["red"], axis="right", scale=100.0, valid_min=0.0, valid_max=1.0),
             ),
+            display_horizon_hours=POWER_FORECAST_DISPLAY_HOURS,
         ),
         PanelSpec(
             "soc_hindcast",
@@ -1844,6 +1849,7 @@ SUMMARY_LAYOUTS: dict[str, tuple[PanelSpec, ...]] = {
                     line_width=2.6,
                 ),
             ),
+            display_horizon_hours=POWER_FORECAST_DISPLAY_HOURS,
         ),
         PanelSpec(
             "operating_plan_schedule",
@@ -1856,6 +1862,7 @@ SUMMARY_LAYOUTS: dict[str, tuple[PanelSpec, ...]] = {
                 TraceSpec("OperatingCL61OptimizedRadarOn", "Recommended Radar schedule", COLOR["blue"], dash="dash", step=True, valid_min=0.0, valid_max=1.0, line_width=2.5),
                 TraceSpec("OperatingCL61OptimizedHATPROOn", "Recommended HATPRO schedule", COLOR["purple"], dash="dot", step=True, valid_min=0.0, valid_max=1.0, line_width=2.5),
             ),
+            display_horizon_hours=POWER_FORECAST_DISPLAY_HOURS,
         ),
         PanelSpec(
             "ecmwf_solar_forecast",
@@ -1868,6 +1875,7 @@ SUMMARY_LAYOUTS: dict[str, tuple[PanelSpec, ...]] = {
                 TraceSpec("OperatingCurrentLoadP50Watts", "Current Instrument Load", COLOR["slate"], axis="right", dash="dot", valid_min=0.0),
                 TraceSpec("OperatingCL61OptimizedLoadP50Watts", "Recommended Instrument Load", COLOR["red"], axis="right", dash="dashdot", valid_min=0.0, line_width=3.0),
             ),
+            display_horizon_hours=POWER_FORECAST_DISPLAY_HOURS,
         ),
         PanelSpec(
             "soc_forecast_skill",
@@ -2841,11 +2849,22 @@ def _with_system_as_is_decision_fields(
     return result, source_kind
 
 
-def operating_mode_intervals(times: pd.DatetimeIndex, codes: np.ndarray) -> list[tuple[pd.Timestamp, pd.Timestamp, str, str]]:
+def operating_mode_intervals(
+    times: pd.DatetimeIndex,
+    codes: np.ndarray,
+    *,
+    interval_end_aligned: bool = False,
+) -> list[tuple[pd.Timestamp, pd.Timestamp, str, str]]:
     """Return contiguous planned-instrument intervals for forecast plot bands."""
     values = np.asarray(codes, dtype=np.float64)
     if len(times) != len(values) or len(times) == 0:
         return []
+    if interval_end_aligned and len(times) > 1:
+        # Forecast schedules store the state used to integrate the interval
+        # ending at each timestamp. Shift only the presentation coordinates;
+        # the physical forecast product remains unchanged.
+        times = times[:-1]
+        values = values[1:]
     valid = np.isfinite(values)
     if not valid.any():
         return []
@@ -2875,7 +2894,11 @@ def _add_operating_schedule_bands(fig: go.Figure, ds: xr.Dataset, *, row: int) -
     if field not in ds or "time" not in ds:
         return
     times = pd.DatetimeIndex(ds["time"].values)
-    for start, end, label, color in operating_mode_intervals(times, np.asarray(ds[field].values)):
+    for start, end, label, color in operating_mode_intervals(
+        times,
+        np.asarray(ds[field].values),
+        interval_end_aligned=True,
+    ):
         fig.add_vrect(
             x0=start,
             x1=end,
@@ -3404,7 +3427,7 @@ def _crop_to_summary_display_window(ds: xr.Dataset, times: pd.DatetimeIndex) -> 
         forecast_valid = np.zeros(len(times), dtype=bool)
         for name in forecast_names:
             forecast_valid |= np.isfinite(np.asarray(ds[name].values, dtype=np.float64))
-        forecast_end = end + pd.Timedelta(hours=float(os.environ.get("AURORA_POWER_SOC_FORECAST_HOURS", "96")))
+        forecast_end = end + pd.Timedelta(hours=POWER_FORECAST_DISPLAY_HOURS)
         forecast_mask = forecast_valid & (times <= forecast_end)
         if start is not None:
             forecast_mask &= times >= start
@@ -3818,12 +3841,18 @@ def _trace_plot_values(
     values: np.ndarray,
     max_time_samples: int,
     trace: TraceSpec,
+    display_horizon_hours: float | None = None,
 ) -> tuple[pd.DatetimeIndex, np.ndarray]:
     if trace.projection_lookback_minutes is not None:
         return _projection_trace_values(times, values, trace, max_time_samples)
     trace_times, trace_values = _trace_time_values(times, values)
-    if trace.display_horizon_hours is not None and len(trace_times):
-        display_end = trace_times.min() + pd.Timedelta(hours=float(trace.display_horizon_hours))
+    horizon_candidates = [
+        float(value)
+        for value in (trace.display_horizon_hours, display_horizon_hours)
+        if value is not None
+    ]
+    if horizon_candidates and len(trace_times):
+        display_end = trace_times.min() + pd.Timedelta(hours=min(horizon_candidates))
         display_mask = trace_times <= display_end
         trace_times = trace_times[display_mask]
         trace_values = trace_values[display_mask]
@@ -4083,8 +4112,18 @@ def save_summary_png(
         right_axis_values: list[np.ndarray] = []
         for trace, values in rows:
             target = right_ax if trace.axis == "right" and right_ax is not None else ax
-            drawstyle = "steps-post" if trace.step else "default"
-            trace_times, trace_values = _trace_plot_values(times, values, max_time_samples, trace)
+            drawstyle = (
+                "steps-pre"
+                if trace.step and panel.key == "operating_plan_schedule"
+                else "steps-post" if trace.step else "default"
+            )
+            trace_times, trace_values = _trace_plot_values(
+                times,
+                values,
+                max_time_samples,
+                trace,
+                panel.display_horizon_hours,
+            )
             if len(trace_times) == 0:
                 continue
             trace_label = power_trace_label(ds, trace)
@@ -4329,7 +4368,13 @@ def build_summary_plotly(
                 right_color = trace.color
             if not secondary and left_color is None:
                 left_color = trace.color
-            trace_times, trace_values = _trace_plot_values(times, values, max_time_samples, trace)
+            trace_times, trace_values = _trace_plot_values(
+                times,
+                values,
+                max_time_samples,
+                trace,
+                panel.display_horizon_hours,
+            )
             if len(trace_times) == 0:
                 continue
             trace_start = trace_times.min()
@@ -4363,7 +4408,16 @@ def build_summary_plotly(
                     mode="lines",
                     name=trace_label,
                     legend=legend_name,
-                    line=dict(color=trace.color, width=trace.line_width, dash=trace.dash or "solid", shape="hv" if trace.step else "linear"),
+                    line=dict(
+                        color=trace.color,
+                        width=trace.line_width,
+                        dash=trace.dash or "solid",
+                        shape=(
+                            "vh"
+                            if trace.step and panel.key == "operating_plan_schedule"
+                            else "hv" if trace.step else "linear"
+                        ),
+                    ),
                     opacity=trace.opacity,
                     hovertemplate=f"Time=%{{x}}<br>{trace_label}=%{{y:.6g}}<extra></extra>",
                     connectgaps=False,

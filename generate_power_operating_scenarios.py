@@ -183,23 +183,26 @@ def _json_object(value: object) -> dict[str, object]:
 
 
 def _schedule_windows(times: pd.DatetimeIndex, mode_codes: np.ndarray) -> list[dict[str, object]]:
-    """Store compact, human-auditable operating-mode windows for a decision."""
-    if len(times) == 0:
+    """Store interval-end schedule values as compact UTC operating windows."""
+    if len(times) < 2 or len(mode_codes) < 2:
         return []
+    # Scenario mode at index i is the state integrated over (time[i-1],
+    # time[i]].  Convert that interval-end convention into conventional
+    # start/stop windows for the archive and operator display.
+    interval_codes = np.asarray(mode_codes[1:], dtype=np.int16)
     windows: list[dict[str, object]] = []
     start = 0
-    for index in range(1, len(times) + 1):
-        if index < len(times) and int(mode_codes[index]) == int(mode_codes[start]):
+    for index in range(1, len(interval_codes) + 1):
+        if index < len(interval_codes) and int(interval_codes[index]) == int(interval_codes[start]):
             continue
-        end = index
-        stop = times[end] if end < len(times) else times[-1] + pd.Timedelta(hours=1)
+        stop = times[index]
         windows.append(
             {
                 "start_time_utc": times[start].isoformat(),
                 "stop_time_utc": stop.isoformat(),
-                "mode_code": int(mode_codes[start]),
-                "mode": mode_from_code(int(mode_codes[start])),
-                "mode_label": mode_label(mode_from_code(int(mode_codes[start]))),
+                "mode_code": int(interval_codes[start]),
+                "mode": mode_from_code(int(interval_codes[start])),
+                "mode_label": mode_label(mode_from_code(int(interval_codes[start]))),
             }
         )
         start = index
@@ -285,9 +288,19 @@ def _archive_recommendation(
     )
     start = scenarios["ScenarioStartTime"].values[index]
     stop = scenarios["ScenarioStopTime"].values[index]
-    decision_hours = min(int(scenarios.attrs.get("optimization_horizon_hours", 96)), len(scenarios["time"]))
-    decision_times = pd.DatetimeIndex(scenarios["time"].values[:decision_hours])
-    mode_codes = np.asarray(scenarios["ScenarioModeCode"].values[index, :decision_hours], dtype=np.int16)
+    configured_horizon = max(
+        int(float(scenarios.attrs.get("optimization_horizon_hours", 96))),
+        0,
+    )
+    decision_count = min(configured_horizon + 1, len(scenarios["time"]))
+    decision_times = pd.DatetimeIndex(scenarios["time"].values[:decision_count])
+    decision_horizon_hours = int(
+        (decision_times[-1] - decision_times[0]) / pd.Timedelta(hours=1)
+    )
+    mode_codes = np.asarray(scenarios["ScenarioModeCode"].values[index, :decision_count], dtype=np.int16)
+    instrument_hours = _json_object(
+        scenarios.attrs.get("optimized_instrument_hours", "{}")
+    )
     decision_key = "|".join(
         (
             pd.Timestamp(decision_times[0]).floor("h").isoformat(),
@@ -298,7 +311,7 @@ def _archive_recommendation(
     record = {
         "decision_id": hashlib.sha256(decision_key.encode("utf-8")).hexdigest()[:16],
         "issued_at_utc": _utc_now(),
-        "decision_horizon_hours": decision_hours,
+        "decision_horizon_hours": decision_horizon_hours,
         "safety_constraint": "P10 SOC must remain at or above 40%",
         "optimization_objective": (
             "reserve the feasible CL61 timetable first, then add Radar and HATPRO "
@@ -308,9 +321,7 @@ def _archive_recommendation(
         "instrument_priority": _json_string_list(
             scenarios.attrs.get("optimized_priority_order", "[]")
         ),
-        "instrument_hours": _json_object(
-            scenarios.attrs.get("optimized_instrument_hours", "{}")
-        ),
+        "instrument_hours": instrument_hours,
         "instrument_starts": _json_object(
             scenarios.attrs.get("optimized_instrument_starts", "{}")
         ),
@@ -336,7 +347,12 @@ def _archive_recommendation(
         "current_mode": str(scenarios.attrs.get("current_mode", "")),
         "start_time": None if str(start) == "NaT" else str(start),
         "stop_time": None if str(stop) == "NaT" else str(stop),
-        "collection_hours": float(scenarios["ScenarioCollectionHours"].values[index]),
+        "collection_hours": float(
+            instrument_hours.get(
+                "CL61",
+                scenarios["ScenarioCollectionHours"].values[index],
+            )
+        ),
         "minimum_p10_soc": float(scenarios["ScenarioMinimumP10SOC"].values[index]),
         "final_p10_soc": float(scenarios["ScenarioFinalP10SOC"].values[index]),
         "starts": int(scenarios["ScenarioStarts"].values[index]),
@@ -393,32 +409,32 @@ def _archive_recommendation(
             "mode_label": [mode_label(mode_from_code(int(value))) for value in mode_codes],
             "active_instrument_count": [
                 int(value)
-                for value in scenarios["ScenarioActiveInstrumentCount"].values[index, :decision_hours]
+                for value in scenarios["ScenarioActiveInstrumentCount"].values[index, :decision_count]
             ],
             "load_p10_w": [
-                _json_float(value) for value in scenarios["ScenarioLoadP10Watts"].values[index, :decision_hours]
+                _json_float(value) for value in scenarios["ScenarioLoadP10Watts"].values[index, :decision_count]
             ],
             "load_p50_w": [
-                _json_float(value) for value in scenarios["ScenarioLoadP50Watts"].values[index, :decision_hours]
+                _json_float(value) for value in scenarios["ScenarioLoadP50Watts"].values[index, :decision_count]
             ],
             "load_p90_w": [
-                _json_float(value) for value in scenarios["ScenarioLoadP90Watts"].values[index, :decision_hours]
+                _json_float(value) for value in scenarios["ScenarioLoadP90Watts"].values[index, :decision_count]
             ],
             "soc_p10_pct": [
-                _json_float(value) for value in scenarios["ScenarioSOCP10"].values[index, :decision_hours]
+                _json_float(value) for value in scenarios["ScenarioSOCP10"].values[index, :decision_count]
             ],
             "soc_p50_pct": [
-                _json_float(value) for value in scenarios["ScenarioSOCP50"].values[index, :decision_hours]
+                _json_float(value) for value in scenarios["ScenarioSOCP50"].values[index, :decision_count]
             ],
             "soc_p90_pct": [
-                _json_float(value) for value in scenarios["ScenarioSOCP90"].values[index, :decision_hours]
+                _json_float(value) for value in scenarios["ScenarioSOCP90"].values[index, :decision_count]
             ],
             "p50_continuation_mode_code": (
                 [
                     int(value)
                     for value in scenarios["ScenarioModeCode"].values[
                         continuation_index,
-                        :decision_hours,
+                        :decision_count,
                     ]
                 ]
                 if continuation_index is not None
@@ -429,7 +445,7 @@ def _archive_recommendation(
                     _json_float(value)
                     for value in scenarios["ScenarioSOCP50"].values[
                         continuation_index,
-                        :decision_hours,
+                        :decision_count,
                     ]
                 ]
                 if continuation_index is not None

@@ -2358,6 +2358,12 @@ def power(window: str = "24h", group: str = "all") -> dict[str, Any]:
                         "color": trace.color,
                         "axis": trace.axis,
                         "dash": trace.dash,
+                        "step": trace.step,
+                        "stepAlignment": (
+                            "intervalEnd"
+                            if trace.step and panel.key == "operating_plan_schedule"
+                            else "intervalStart"
+                        ),
                         "unit": _power_trace_display_unit(dataset, trace),
                         "points": [
                             {"time": pd.Timestamp(moment).isoformat() + "Z", "value": round(float(value), 5), "segment": segment}

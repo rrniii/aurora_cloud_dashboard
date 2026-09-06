@@ -49,6 +49,7 @@ try:
 except Exception:  # pragma: no cover - dashboard can still serve source images.
     Image = None
 from grouped_timeseries import (
+    POWER_FORECAST_DISPLAY_HOURS,
     POWER_PANEL_TIME_GROUP_BY_KEY,
     SUMMARY_LAYOUTS,
     build_power_forecast_info,
@@ -1381,7 +1382,7 @@ def _open_power_display_summary_window(start, end, section: str | None = None) -
     with _timed_perf("power_display_summary_window", instrument="power", start=start_dt, end=end_dt) as perf:
         window_end = end_dt
         if section == "forecast":
-            window_end = end_dt + pd.Timedelta(hours=float(os.environ.get("AURORA_POWER_SOC_FORECAST_HOURS", "96")))
+            window_end = end_dt + pd.Timedelta(hours=POWER_FORECAST_DISPLAY_HOURS)
         window = ds.sel(time=slice(start_dt, window_end))
         matched = int(window.sizes.get("time", 0))
         perf["matched_time_count"] = matched
@@ -8577,6 +8578,7 @@ def _add_custom_schedule_bands(figure: go.Figure, result: dict) -> None:
     for start, end, label, color in operating_mode_intervals(
         pd.DatetimeIndex(result["time"]),
         np.asarray(result["mode_codes"]),
+        interval_end_aligned=True,
     ):
         figure.add_vrect(
             x0=start,
@@ -8604,12 +8606,46 @@ def _build_custom_cl61_plan_view(start_value, duration_value, kit_value):
             start_time=pd.Timestamp(start_value),
             duration_hours=max(int(duration_value), MIN_RUN_HOURS if str(kit_value) == "CL61" else 1),
             kit=str(kit_value),
+            decision_horizon_hours=int(POWER_FORECAST_DISPLAY_HOURS),
         )
     except Exception as exc:
         return pn.pane.Alert(f"Could not calculate the custom operating plan: {exc}", alert_type="danger")
 
-    minimum_p10 = float(result["minimum_p10_soc"])
-    status_label, status_level = _operating_plan_status(minimum_p10)
+    full_times = pd.DatetimeIndex(result["time"])
+    display_start = full_times.min()
+    display_end = display_start + pd.Timedelta(hours=POWER_FORECAST_DISPLAY_HOURS)
+    display_mask = np.asarray(full_times <= display_end, dtype=bool)
+    times = full_times[display_mask]
+    display_result = dict(result)
+    display_result["time"] = times
+    for name in (
+        "modes",
+        "mode_codes",
+        "load_p50_w",
+        "soc_p10",
+        "soc_p50",
+        "soc_p90",
+        "below_40_probability",
+    ):
+        values = result.get(name)
+        if values is not None and len(values) == len(full_times):
+            display_result[name] = np.asarray(values)[display_mask]
+
+    safety_minimum_p10 = float(result["minimum_p10_soc"])
+    status_label, status_level = _operating_plan_status(safety_minimum_p10)
+    display_soc_p10 = np.asarray(display_result["soc_p10"], dtype=np.float64)
+    display_minimum_p10 = float(
+        result.get("decision_minimum_p10_soc", np.nanmin(display_soc_p10))
+    )
+    display_final_p10 = float(
+        result.get("decision_final_p10_soc", display_soc_p10[-1])
+    )
+    safety_horizon_hours = float(
+        result.get(
+            "safety_horizon_hours",
+            (full_times.max() - full_times.min()) / pd.Timedelta(hours=1),
+        )
+    )
     current_mode = str(scenarios.attrs.get("current_mode_label", "Unknown"))
     mode_maturity = str(scenarios.attrs.get("current_mode_maturity", "observed")).replace("_", " ").title()
     confidence = float(scenarios.attrs.get("current_mode_confidence", "nan"))
@@ -8620,13 +8656,16 @@ def _build_custom_cl61_plan_view(start_value, duration_value, kit_value):
         + _operating_plan_metric("Detected mode", current_mode)
         + _operating_plan_metric("Mode evidence", mode_maturity)
         + _operating_plan_metric("Mode confidence", confidence_text)
-        + _operating_plan_metric(f"{result['kit']} collection", f"{float(result['collection_hours']):.0f} h")
-        + _operating_plan_metric("Minimum P10 SOC", f"{minimum_p10:.1f}%")
-        + _operating_plan_metric("Final P10 SOC", f"{float(result['final_p10_soc']):.1f}%")
+        + _operating_plan_metric(f"{result['kit']} collection (96 h)", f"{float(result['collection_hours']):.0f} h")
+        + _operating_plan_metric("Minimum P10 SOC (96 h)", f"{display_minimum_p10:.1f}%")
+        + _operating_plan_metric("Final P10 SOC (96 h)", f"{display_final_p10:.1f}%")
+        + _operating_plan_metric(
+            f"Safety-tail minimum P10 ({safety_horizon_hours:.0f} h)",
+            f"{safety_minimum_p10:.1f}%",
+        )
         + "</div>"
     )
 
-    times = pd.DatetimeIndex(result["time"])
     figure = make_subplots(
         rows=2,
         cols=1,
@@ -8635,12 +8674,13 @@ def _build_custom_cl61_plan_view(start_value, duration_value, kit_value):
         row_heights=(0.68, 0.32),
     )
     for name, label, color, dash in (
-        ("soc_p10", "SOC P10", "#7fb6d6", "dot"),
+        ("soc_p10", "SOC P10", "#1f5f99", "dash"),
         ("soc_p50", "SOC Median", "#4f8c63", "solid"),
         ("soc_p90", "SOC P90", "#7fb6d6", "dot"),
     ):
+        width = 3.0 if name == "soc_p50" else 2.2
         figure.add_trace(
-            go.Scatter(x=times, y=result[name], mode="lines", name=label, line=dict(color=color, width=2, dash=dash)),
+            go.Scatter(x=times, y=display_result[name], mode="lines", name=label, line=dict(color=color, width=width, dash=dash)),
             row=1,
             col=1,
         )
@@ -8655,15 +8695,16 @@ def _build_custom_cl61_plan_view(start_value, duration_value, kit_value):
         row=1,
         col=1,
     )
-    _add_custom_schedule_bands(figure, result)
+    _add_custom_schedule_bands(figure, display_result)
     figure.add_trace(
-        go.Scatter(x=times, y=result["load_p50_w"], mode="lines", name="Forecast Load", line=dict(color="#c05647", width=2)),
+        go.Scatter(x=times, y=display_result["load_p50_w"], mode="lines", name="Forecast Load", line=dict(color="#c05647", width=2)),
         row=2,
         col=1,
     )
     figure.update_yaxes(title_text="State of Charge [%]", range=[0, 100], row=1, col=1)
     figure.update_yaxes(title_text="Load [W]", rangemode="tozero", row=2, col=1)
     figure.update_xaxes(title_text="Date and Time (UTC)", row=2, col=1)
+    figure.update_xaxes(range=[display_start, display_end])
     figure.update_layout(
         height=520,
         margin=dict(l=70, r=30, t=20, b=55),
@@ -8696,13 +8737,21 @@ def _operating_decision_audit_view():
         return pn.pane.Alert("No archived 96 h operating decision is available yet.", alert_type="warning")
 
     verification = record.get("verification") if isinstance(record.get("verification"), dict) else {}
+    instrument_hours = (
+        record.get("instrument_hours")
+        if isinstance(record.get("instrument_hours"), dict)
+        else {}
+    )
+    planned_cl61_hours = float(
+        instrument_hours.get("CL61", record.get("collection_hours", 0.0))
+    )
     status = str(verification.get("status", "awaiting measurements")).replace("_", " ").title()
     minimum_actual = verification.get("minimum_actual_soc_pct")
     mode_adherence = verification.get("mode_adherence_fraction")
     metrics = (
         "<div class='operating-plan-metrics'>"
         + _operating_plan_metric("Decision window", f"{int(record.get('decision_horizon_hours', 96))} h")
-        + _operating_plan_metric("Planned CL61 collection", f"{float(record.get('collection_hours', 0.0)):.0f} h")
+        + _operating_plan_metric("Planned CL61 collection (decision window)", f"{planned_cl61_hours:.0f} h")
         + _operating_plan_metric("Forecast min P10 SOC", f"{float(record.get('minimum_p10_soc', float('nan'))):.1f}%")
         + _operating_plan_metric("Verification", status)
         + _operating_plan_metric(
@@ -9468,7 +9517,7 @@ browser_overview_tab = pn.Column(
 def _mobile_power_window() -> xr.Dataset | None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     start = now - DEFAULT_WINDOW
-    end = now + timedelta(hours=float(os.environ.get("AURORA_POWER_SOC_FORECAST_HOURS", "48")))
+    end = now
     section = power_view_select.value
     ds = _open_power_display_summary_window(start, end, section=section)
     if ds is None:
@@ -9486,6 +9535,7 @@ def _mobile_trace_values(
     include_future: bool,
     *,
     start_at: pd.Timestamp | None = None,
+    display_horizon_hours: float | None = None,
 ) -> tuple[pd.DatetimeIndex, np.ndarray]:
     if trace.var not in ds or "time" not in ds:
         return pd.DatetimeIndex([]), np.asarray([], dtype=float)
@@ -9507,8 +9557,14 @@ def _mobile_trace_values(
         return pd.DatetimeIndex([]), np.asarray([], dtype=float)
     out_times = times[mask]
     out_values = values[mask] * float(trace.scale)
-    if trace.display_horizon_hours is not None and len(out_times):
-        display_end = out_times.min() + pd.Timedelta(hours=float(trace.display_horizon_hours))
+    horizon_candidates = [
+        float(value)
+        for value in (trace.display_horizon_hours, display_horizon_hours)
+        if value is not None
+    ]
+    if horizon_candidates and len(out_times):
+        display_anchor = start_at if start_at is not None else out_times.min()
+        display_end = display_anchor + pd.Timedelta(hours=min(horizon_candidates))
         display_mask = out_times <= display_end
         out_times = out_times[display_mask]
         out_values = out_values[display_mask]
@@ -9658,7 +9714,13 @@ def _power_plot_card(ds: xr.Dataset, panel, *, mobile: bool) -> pn.Column | None
     for trace in panel.traces:
         if trace.projection_lookback_minutes is not None:
             continue
-        times, values = _mobile_trace_values(ds, trace, include_future=include_future, start_at=forecast_start)
+        times, values = _mobile_trace_values(
+            ds,
+            trace,
+            include_future=include_future,
+            start_at=forecast_start,
+            display_horizon_hours=panel.display_horizon_hours,
+        )
         if len(times) == 0:
             continue
         use_right = trace.axis == "right" and has_right_axis
@@ -9682,7 +9744,16 @@ def _power_plot_card(ds: xr.Dataset, panel, *, mobile: bool) -> pn.Column | None
                 mode="lines",
                 name=trace_label,
                 yaxis="y2" if use_right else "y",
-                line=dict(color=trace.color, width=trace.line_width, dash=trace.dash or "solid", shape="hv" if trace.step else "linear"),
+                line=dict(
+                    color=trace.color,
+                    width=trace.line_width,
+                    dash=trace.dash or "solid",
+                    shape=(
+                        "vh"
+                        if trace.step and panel.key == "operating_plan_schedule"
+                        else "hv" if trace.step else "linear"
+                    ),
+                ),
                 opacity=trace.opacity,
                 hovertemplate=f"Time=%{{x}}<br>{trace_label}=%{{y:.4g}}<extra></extra>",
                 connectgaps=False,
@@ -9693,6 +9764,7 @@ def _power_plot_card(ds: xr.Dataset, panel, *, mobile: bool) -> pn.Column | None
         for start, end, label, color in operating_mode_intervals(
             schedule_times,
             np.asarray(ds["OperatingCL61OptimizedModeCode"].values),
+            interval_end_aligned=True,
         ):
             fig.add_vrect(
                 x0=start,
@@ -9761,6 +9833,11 @@ def _power_plot_card(ds: xr.Dataset, panel, *, mobile: bool) -> pn.Column | None
             nticks=4 if mobile else 6,
         ),
     )
+    if panel.display_horizon_hours is not None and forecast_start is not None:
+        layout["xaxis"]["range"] = [
+            forecast_start,
+            forecast_start + pd.Timedelta(hours=float(panel.display_horizon_hours)),
+        ]
     if has_right_axis:
         layout["yaxis2"] = dict(
             title=None if mobile else panel.right_axis_label,
@@ -9875,7 +9952,11 @@ def _browser_power_briefing(instrument, start, end):
         return pn.Spacer(height=0)
     ds = _open_power_display_summary_window(start, end, section="forecast")
     if ds is None or "time" not in ds:
-        return pn.pane.Alert("Power forecast data is not available.", alert_type="warning")
+        return pn.pane.Alert(
+            "Power forecast data is not available.",
+            alert_type="warning",
+            css_classes=["power-forecast-unavailable"],
+        )
     ds.attrs[SUMMARY_DISPLAY_START_ATTR] = _as_naive_utc_datetime(start).isoformat()
     ds.attrs[SUMMARY_DISPLAY_END_ATTR] = _as_naive_utc_datetime(end).isoformat()
     ds = prepare_summary_dataset(ds, "power")
@@ -9897,6 +9978,16 @@ _sync_power_section_visibility()
 def _mobile_power_section(section: str, _live_refresh_anchor):
     ds = _mobile_power_window()
     if ds is None or "time" not in ds:
+        if section == "forecast":
+            return pn.Column(
+                pn.pane.Alert(
+                    "Power forecast data is not available.",
+                    alert_type="warning",
+                    css_classes=["power-forecast-unavailable"],
+                ),
+                sizing_mode="stretch_width",
+                css_classes=["mobile-shell", "mobile-shell--power"],
+            )
         return pn.Column(
             pn.pane.HTML("<div class='mobile-plot-card__empty'>Power display data is not available.</div>", sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
