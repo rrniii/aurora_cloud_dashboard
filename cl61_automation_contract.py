@@ -25,6 +25,16 @@ ALLOWED_ACTIONS = {"hold", "start", "stop"}
 ALLOWED_ENVIRONMENTS = {"development", "production"}
 HMAC_ALGORITHM = "hmac-sha256"
 UNSIGNED_ALGORITHM = "none"
+REQUIRED_OPERATIONAL_FORECAST_PROVENANCE = (
+    "forecast_system_version",
+    "feature_set_version",
+    "feature_set_digest",
+    "forecast_code_revision",
+    "source_cycle_set_id",
+    "source_manifest_digest",
+    "forecast_identity_id",
+    "scenario_publication_signature",
+)
 
 
 def utc_now() -> datetime:
@@ -206,7 +216,7 @@ def validate_intent(
         forecast = payload.get("forecast")
         if not isinstance(forecast, Mapping) or not all(
             str(forecast.get(name, "")).strip()
-            for name in ("forecast_system_version", "source_cycle_set_id", "scenario_publication_signature")
+            for name in REQUIRED_OPERATIONAL_FORECAST_PROVENANCE
         ):
             errors.append("forecast_provenance_missing")
     return (not errors, tuple(dict.fromkeys(errors)))

@@ -72,6 +72,20 @@ CL61_AUTOMATION_SHADOW_ENABLED = os.environ.get("AURORA_CL61_AUTOMATION_SHADOW_E
     "yes",
 }
 
+# These fields identify the immutable forecast issue that supplied the solar
+# and load trajectory used by the scenario planner.  Keep them on the scenario
+# product so a downstream CL61 intent cannot become detached from its forecast
+# provenance.
+PLANNING_FORECAST_IDENTITY_ATTRS = (
+    "forecast_system_version",
+    "feature_set_version",
+    "feature_set_digest",
+    "forecast_code_revision",
+    "source_cycle_set_id",
+    "source_manifest_digest",
+    "forecast_identity_id",
+)
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -501,7 +515,7 @@ def _validate_operating_inputs(
 def _planning_forecast_provenance(forecast: xr.Dataset) -> dict[str, str]:
     """Capture the exact planning-cycle identity used for a scenario product."""
     times = pd.DatetimeIndex(forecast["time"].values)
-    return {
+    provenance = {
         "planning_forecast_generated_at_utc": str(forecast.attrs.get("generated_at_utc", "")),
         "planning_forecast_initial_soc_time": str(forecast.attrs.get("initial_soc_time", "")),
         "planning_forecast_refresh_kind": str(forecast.attrs.get("forecast_refresh_kind", "")),
@@ -509,6 +523,13 @@ def _planning_forecast_provenance(forecast: xr.Dataset) -> dict[str, str]:
         "planning_forecast_time_coverage_start": times.min().isoformat() if len(times) else "",
         "planning_forecast_time_coverage_end": times.max().isoformat() if len(times) else "",
     }
+    provenance.update(
+        {
+            name: str(forecast.attrs.get(name, ""))
+            for name in PLANNING_FORECAST_IDENTITY_ATTRS
+        }
+    )
+    return provenance
 
 
 def scenario_publication_signature(scenarios: xr.Dataset) -> str:
@@ -525,7 +546,7 @@ def scenario_publication_signature(scenarios: xr.Dataset) -> str:
         return np.rint(finite / float(step)).astype(np.int32).ravel().tolist()
 
     payload = {
-        "schema": 2,
+        "schema": 3,
         "scenario_schema_version": str(attrs.get("schema_version", "")),
         "anchor_30min": anchor_bucket,
         "initial_soc_pct": round(float(attrs.get("initial_soc_pct", 0.0))),
@@ -537,6 +558,10 @@ def scenario_publication_signature(scenarios: xr.Dataset) -> str:
         "optimized_blocking_instruments": str(attrs.get("optimized_blocking_instruments", "[]")),
         "solar_contract": str(attrs.get("solar_calibration_contract_id", "")),
         "planning_cycle": str(attrs.get("planning_forecast_generated_at_utc", "")),
+        "planning_forecast_identity": {
+            name: str(attrs.get(name, ""))
+            for name in PLANNING_FORECAST_IDENTITY_ATTRS
+        },
         "scenario_ids": [str(value) for value in scenarios.get_index("scenario")],
         "scenario_maturity": [str(value) for value in scenarios["scenario_mode_maturity"].values],
         "uas_tier_profiles": str(attrs.get("uas_tier_profiles", "{}")),

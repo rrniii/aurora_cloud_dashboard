@@ -22,18 +22,32 @@ class CL61AutomationContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.now = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)
 
-    def _intent(self, *, authority: str = AUTHORITY_DIAGNOSTIC, key: bytes | None = None) -> dict:
+    def _intent(
+        self,
+        *,
+        authority: str = AUTHORITY_DIAGNOSTIC,
+        key: bytes | None = None,
+        omit_forecast_field: str | None = None,
+    ) -> dict:
+        forecast = {
+            "forecast_system_version": "power-v12-hybrid-candidate",
+            "feature_set_version": "physical-solar-load-v3",
+            "feature_set_digest": f"sha256:{'1' * 64}",
+            "forecast_code_revision": "0123456789abcdef",
+            "source_cycle_set_id": "cycle",
+            "source_manifest_digest": f"sha256:{'2' * 64}",
+            "forecast_identity_id": "forecast-identity-v1-test",
+            "scenario_publication_signature": "scenario-signature",
+        }
+        if omit_forecast_field is not None:
+            forecast.pop(omit_forecast_field)
         return build_intent(
             environment="development",
             authority=authority,
             proposed_action="start",
             desired_outlet_state=True,
             reason_codes=["test"],
-            forecast={
-                "forecast_system_version": "power-v12-hybrid-candidate",
-                "source_cycle_set_id": "cycle",
-                "scenario_publication_signature": "scenario-signature",
-            },
+            forecast=forecast,
             safety={
                 "control_eligible": authority == AUTHORITY_OPERATIONAL,
                 "planning_ready": True,
@@ -72,6 +86,36 @@ class CL61AutomationContractTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("content_digest_mismatch", errors)
 
+    def test_operational_intent_requires_complete_forecast_provenance(self) -> None:
+        key = b"test-signing-key"
+        for name in (
+            "forecast_system_version",
+            "feature_set_version",
+            "feature_set_digest",
+            "forecast_code_revision",
+            "source_cycle_set_id",
+            "source_manifest_digest",
+            "forecast_identity_id",
+            "scenario_publication_signature",
+        ):
+            diagnostic = self._intent(omit_forecast_field=name)
+            valid, errors = validate_intent(diagnostic, now=self.now)
+            self.assertTrue(valid, msg=f"diagnostic intent unexpectedly rejected without {name}: {errors}")
+
+            operational = self._intent(
+                authority=AUTHORITY_OPERATIONAL,
+                key=key,
+                omit_forecast_field=name,
+            )
+            valid, errors = validate_intent(
+                operational,
+                now=self.now,
+                signing_key=key,
+                require_operational=True,
+            )
+            self.assertFalse(valid, msg=f"operational intent unexpectedly accepted without {name}")
+            self.assertIn("forecast_provenance_missing", errors)
+
     def test_validation_rejects_wrong_outlet_and_expired_intent(self) -> None:
         intent = self._intent()
         intent["target"]["pdu_outlet"] = 6
@@ -99,12 +143,36 @@ class CL61AutomationContractTests(unittest.TestCase):
                 "minimum_controlled_run_hours": "12",
                 "optimized_schedule_policy": "cl61_primary_v1",
                 "publication_signature": "scenario-signature",
+                "forecast_system_version": "power-v12-test",
+                "feature_set_version": "physical-solar-load-test-v1",
+                "feature_set_digest": f"sha256:{'1' * 64}",
+                "forecast_code_revision": "0123456789abcdef",
+                "source_cycle_set_id": "ecmwf:2026-08-30T00:00:00Z",
+                "source_manifest_digest": f"sha256:{'2' * 64}",
+                "forecast_identity_id": "forecast-identity-v1-test",
             },
         )
         intent = build_diagnostic_intent(scenarios, generated_at=self.now)
         self.assertEqual(intent["authority"], AUTHORITY_DIAGNOSTIC)
         self.assertEqual(intent["proposed_action"], "start")
         self.assertFalse(intent["safety"]["control_eligible"])
+        self.assertEqual(
+            intent["forecast"],
+            {
+                "forecast_system_version": "power-v12-test",
+                "feature_set_version": "physical-solar-load-test-v1",
+                "feature_set_digest": f"sha256:{'1' * 64}",
+                "forecast_code_revision": "0123456789abcdef",
+                "source_cycle_set_id": "ecmwf:2026-08-30T00:00:00Z",
+                "source_manifest_digest": f"sha256:{'2' * 64}",
+                "forecast_identity_id": "forecast-identity-v1-test",
+                "planning_forecast_generated_at_utc": "",
+                "planning_forecast_initial_soc_time": "",
+                "scenario_publication_signature": "scenario-signature",
+                "schedule_policy": "cl61_primary_v1",
+                "schedule_time_utc": "2026-08-30T13:00:00Z",
+            },
+        )
 
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

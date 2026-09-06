@@ -23,7 +23,7 @@ from cl61_automation_contract import (
     CL61_PDU_OUTLET,
     build_intent,
 )
-from power_operating_scenarios import SCENARIO_OPTIMIZED, mode_kits
+from power_operating_scenarios import SCENARIO_OPTIMIZED
 
 
 DEFAULT_TTL_SECONDS = 900
@@ -104,7 +104,6 @@ def build_diagnostic_intent(
     reason_codes = ["control_capability_disabled", "forecast_control_evidence_not_accepted"]
     desired = False
     proposed_action = "hold"
-    schedule_safe = False
     current_on = False
     future_on = False
     mode_time_utc = ""
@@ -136,9 +135,11 @@ def build_diagnostic_intent(
     forecast = {
         "forecast_system_version": str(scenarios.attrs.get("forecast_system_version", "")),
         "feature_set_version": str(scenarios.attrs.get("feature_set_version", "")),
+        "feature_set_digest": str(scenarios.attrs.get("feature_set_digest", "")),
         "forecast_code_revision": str(scenarios.attrs.get("forecast_code_revision", "")),
         "source_cycle_set_id": str(scenarios.attrs.get("source_cycle_set_id", "")),
         "source_manifest_digest": str(scenarios.attrs.get("source_manifest_digest", "")),
+        "forecast_identity_id": str(scenarios.attrs.get("forecast_identity_id", "")),
         "planning_forecast_generated_at_utc": str(scenarios.attrs.get("planning_forecast_generated_at_utc", "")),
         "planning_forecast_initial_soc_time": str(scenarios.attrs.get("planning_forecast_initial_soc_time", "")),
         "scenario_publication_signature": str(scenarios.attrs.get("publication_signature", "")),

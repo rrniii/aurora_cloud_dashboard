@@ -45,7 +45,6 @@ from power_state_catalog import (
     UAS_CHARGE_EMPIRICAL_INCREMENT_P10_W,
     UAS_CHARGE_EMPIRICAL_INCREMENT_P50_W,
     UAS_CHARGE_EMPIRICAL_INCREMENT_P90_W,
-    UAS_CHARGE_ESTIMATE_W,
     canonical_uas_tier,
     tier_is_learning_source,
 )
@@ -102,7 +101,17 @@ def _forecast_inputs(issue: pd.Timestamp, horizon_hours: int = 96) -> tuple[xr.D
             "ForecastLoadWatts": (("time",), load),
         },
         coords={"time": times},
-        attrs={"battery_capacity_kwh": "26", "initial_soc_time": issue.isoformat()},
+        attrs={
+            "battery_capacity_kwh": "26",
+            "initial_soc_time": issue.isoformat(),
+            "forecast_system_version": "power-v12-test",
+            "feature_set_version": "physical-solar-load-test-v1",
+            "feature_set_digest": f"sha256:{'1' * 64}",
+            "forecast_code_revision": "0123456789abcdef",
+            "source_cycle_set_id": "ecmwf:2026-07-15T12:00:00Z",
+            "source_manifest_digest": f"sha256:{'2' * 64}",
+            "forecast_identity_id": "forecast-identity-v1-test",
+        },
     )
     members = np.vstack([solar * factor for factor in np.linspace(0.75, 1.25, 20)])
     ensemble = xr.Dataset(
@@ -294,6 +303,13 @@ class OperatingScenarioTests(unittest.TestCase):
                 "initial_soc_time": "2026-07-18T00:00:00",
                 "forecast_refresh_kind": "cached_reanchor",
                 "forecast_verification_eligible": "false",
+                "forecast_system_version": "power-v12-test",
+                "feature_set_version": "physical-solar-load-test-v1",
+                "feature_set_digest": f"sha256:{'1' * 64}",
+                "forecast_code_revision": "0123456789abcdef",
+                "source_cycle_set_id": "ecmwf:2026-07-18T00:00:00Z",
+                "source_manifest_digest": f"sha256:{'2' * 64}",
+                "forecast_identity_id": "forecast-identity-v1-test",
             },
         )
 
@@ -303,6 +319,13 @@ class OperatingScenarioTests(unittest.TestCase):
         self.assertEqual(provenance["planning_forecast_initial_soc_time"], "2026-07-18T00:00:00")
         self.assertEqual(provenance["planning_forecast_time_coverage_start"], "2026-07-18T00:00:00")
         self.assertEqual(provenance["planning_forecast_time_coverage_end"], "2026-07-18T02:00:00")
+        self.assertEqual(provenance["forecast_system_version"], "power-v12-test")
+        self.assertEqual(provenance["feature_set_version"], "physical-solar-load-test-v1")
+        self.assertEqual(provenance["feature_set_digest"], f"sha256:{'1' * 64}")
+        self.assertEqual(provenance["forecast_code_revision"], "0123456789abcdef")
+        self.assertEqual(provenance["source_cycle_set_id"], "ecmwf:2026-07-18T00:00:00Z")
+        self.assertEqual(provenance["source_manifest_digest"], f"sha256:{'2' * 64}")
+        self.assertEqual(provenance["forecast_identity_id"], "forecast-identity-v1-test")
 
     def test_mode_code_round_trip_supports_combinations(self) -> None:
         value = mode_id(("CL61", "Radar"))
@@ -707,6 +730,39 @@ class OperatingScenarioTests(unittest.TestCase):
         first = scenario_publication_signature(scenarios)
         scenarios["ScenarioLoadP50Watts"].values[0, 0] += 50.0
         self.assertNotEqual(scenario_publication_signature(scenarios), first)
+
+    def test_scenario_publication_signature_binds_forecast_identity(self) -> None:
+        power, pdu = _training_data()
+        model = fit_operating_model(power, pdu, lookback_days=2)
+        issue = pd.Timestamp(power["time"].values[-1])
+        deterministic, ensemble = _forecast_inputs(issue)
+        scenarios = build_operating_scenarios(
+            power,
+            deterministic,
+            model,
+            ensemble=ensemble,
+            horizon_hours=96,
+        )
+        scenarios.attrs.update(_planning_forecast_provenance(deterministic))
+        first = scenario_publication_signature(scenarios)
+
+        for name in (
+            "forecast_system_version",
+            "feature_set_version",
+            "feature_set_digest",
+            "forecast_code_revision",
+            "source_cycle_set_id",
+            "source_manifest_digest",
+            "forecast_identity_id",
+        ):
+            original = scenarios.attrs[name]
+            scenarios.attrs[name] = f"{original}-changed"
+            self.assertNotEqual(
+                scenario_publication_signature(scenarios),
+                first,
+                msg=f"scenario signature did not bind {name}",
+            )
+            scenarios.attrs[name] = original
 
     def test_current_scenario_uses_the_finite_operating_state_and_soc_anchor(self) -> None:
         power, pdu = _training_data()
@@ -1401,6 +1457,34 @@ class OperatingScenarioTests(unittest.TestCase):
             self.assertEqual(automation_status["mode"], "observe_only")
             self.assertFalse(automation_status["capability"])
             self.assertEqual(automation_status["target"]["pdu_outlet"], 5)
+            self.assertEqual(
+                automation_status["forecast"]["forecast_system_version"],
+                deterministic.attrs["forecast_system_version"],
+            )
+            self.assertEqual(
+                automation_status["forecast"]["feature_set_version"],
+                deterministic.attrs["feature_set_version"],
+            )
+            self.assertEqual(
+                automation_status["forecast"]["feature_set_digest"],
+                deterministic.attrs["feature_set_digest"],
+            )
+            self.assertEqual(
+                automation_status["forecast"]["forecast_code_revision"],
+                deterministic.attrs["forecast_code_revision"],
+            )
+            self.assertEqual(
+                automation_status["forecast"]["source_cycle_set_id"],
+                deterministic.attrs["source_cycle_set_id"],
+            )
+            self.assertEqual(
+                automation_status["forecast"]["source_manifest_digest"],
+                deterministic.attrs["source_manifest_digest"],
+            )
+            self.assertEqual(
+                automation_status["forecast"]["forecast_identity_id"],
+                deterministic.attrs["forecast_identity_id"],
+            )
             self.assertTrue(paths["automation_intent"].exists())
             self.assertTrue(paths["automation_history"].exists())
             archive = json.loads(paths["recommendations"].read_text(encoding="utf-8"))
