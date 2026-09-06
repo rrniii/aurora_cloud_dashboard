@@ -4175,8 +4175,14 @@ def _normalize_cache_value(value):
 def _as_naive_utc_datetime(value):
     if value is None:
         return None
-    if isinstance(value, pd.Timestamp):
-        value = value.to_pydatetime(warn=False)
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        timestamp = pd.Timestamp(value)
+        value = timestamp.to_pydatetime(warn=False)
     return _ensure_utc(value)
 
 
