@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,7 @@ from generate_power_soc_forecast import (
     ISSUE_SNAPSHOT_DIGEST_MARKER,
 )
 from generate_power_soc_ensemble import (
+    ENSEMBLE_POWER_MIN_HISTORY_DAYS,
     _ensemble_refresh_reasons,
     _power_at_or_before_cutoff,
     append_ensemble_archive,
@@ -1503,6 +1505,175 @@ class PowerSocForecastTests(unittest.TestCase):
             _power_at_or_before_cutoff(power, pd.Timestamp("2026-07-10T00:00:00"))
         with self.assertRaisesRegex(ValueError, "exact ensemble cutoff"):
             _power_at_or_before_cutoff(power, pd.Timestamp("2026-07-10T01:30:00"))
+
+    def test_ensemble_power_cutoff_keeps_a_lazy_bounded_window(self) -> None:
+        times = pd.date_range("2026-06-20T12:00:00", periods=22 * 24 + 1, freq="1h")
+        cutoff = pd.Timestamp("2026-07-11T10:00:00")
+        power = xr.Dataset(
+            {
+                "BatterySOC": (("time",), np.linspace(90.0, 60.0, len(times))),
+                "ACOutputWatts": (("time",), np.full(len(times), 120.0)),
+                "UnusedDiagnostic": (("time",), np.arange(len(times), dtype=float)),
+            },
+            coords={"time": times},
+        ).chunk({"time": 24})
+
+        selected = _power_at_or_before_cutoff(power, cutoff, history_days=14)
+
+        expected_start = (cutoff - pd.Timedelta(days=14)).normalize()
+        self.assertEqual(pd.Timestamp(selected["time"].values[0]), expected_start)
+        self.assertEqual(pd.Timestamp(selected["time"].values[-1]), cutoff)
+        self.assertNotIn("UnusedDiagnostic", selected)
+        self.assertIsNotNone(getattr(selected["ACOutputWatts"].data, "chunks", None))
+        self.assertEqual(selected.attrs["ensemble_power_history_days"], "14")
+        self.assertEqual(
+            pd.Timestamp(selected.attrs["ensemble_power_window_start_utc"]),
+            expected_start,
+        )
+        self.assertEqual(
+            pd.Timestamp(selected.attrs["ensemble_power_window_end_utc"]),
+            cutoff,
+        )
+
+    def test_ensemble_power_history_covers_long_lead_skill_references(self) -> None:
+        times = pd.date_range("2026-06-20", periods=16 * 24 + 1, freq="1h")
+        power = xr.Dataset(
+            {"BatterySOC": (("time",), np.linspace(90.0, 70.0, len(times)))},
+            coords={"time": times},
+        )
+
+        with self.assertRaisesRegex(ValueError, "must retain at least 12 days"):
+            _power_at_or_before_cutoff(
+                power,
+                pd.Timestamp(times[-1]),
+                history_days=ENSEMBLE_POWER_MIN_HISTORY_DAYS - 0.01,
+            )
+
+        selected = _power_at_or_before_cutoff(
+            power,
+            pd.Timestamp(times[-1]),
+            history_days=ENSEMBLE_POWER_MIN_HISTORY_DAYS,
+        )
+        self.assertEqual(
+            pd.Timestamp(selected["time"].values[0]),
+            (pd.Timestamp(times[-1]) - pd.Timedelta(days=12)).normalize(),
+        )
+
+    def test_ensemble_power_cutoff_does_not_materialise_post_cutoff_state(self) -> None:
+        times = pd.date_range("2026-07-10T00:00:00", periods=6, freq="1h")
+        power = xr.Dataset(
+            {
+                "BatterySOC": (("time",), [70.0, 69.0, 68.0, 67.0, 12.0, 11.0]),
+                "ACOutputWatts": (("time",), [100.0, 100.0, 100.0, 100.0, 900.0, 900.0]),
+            },
+            coords={"time": times},
+        )
+        cutoff = pd.Timestamp("2026-07-10T03:00:00")
+
+        selected = _power_at_or_before_cutoff(power, cutoff)
+
+        self.assertEqual(pd.Timestamp(selected["time"].values[-1]), cutoff)
+        self.assertEqual(float(selected["BatterySOC"].values[-1]), 67.0)
+        self.assertEqual(float(selected["ACOutputWatts"].values[-1]), 100.0)
+
+    def test_ensemble_legacy_load_fallback_matches_full_retained_history(self) -> None:
+        power_times = pd.date_range("2026-06-20", periods=20 * 24 + 1, freq="1h")
+        cutoff = pd.Timestamp(power_times[-1])
+        load = 180.0 + 20.0 * np.sin(np.arange(len(power_times)) / 12.0)
+        power = xr.Dataset(
+            {
+                "BatterySOC": (("time",), np.linspace(90.0, 70.0, len(power_times))),
+                "ACOutputWatts": (("time",), load),
+                "DCInverterWatts": (("time",), np.full(len(power_times), 20.0)),
+            },
+            coords={"time": power_times},
+        )
+        forecast_times = pd.date_range(cutoff, periods=3, freq="3h")
+        solar = xr.Dataset(
+            {
+                "ssrd": (
+                    ("number", "time"),
+                    np.stack(
+                        [
+                            np.arange(len(forecast_times), dtype=float) * 3 * 3600 * value
+                            for value in (100.0, 200.0, 300.0)
+                        ]
+                    ),
+                )
+            },
+            coords={"number": [1, 2, 3], "time": forecast_times},
+        )
+        deterministic = xr.Dataset(
+            attrs={
+                "solar_calibration_factor_w_per_wm2": "1",
+                "battery_capacity_kwh": "26",
+                "load_bias_correction_w": "0",
+                "forecast_load_p10_w": "180",
+                "forecast_load_p50_w": "200",
+                "forecast_load_p90_w": "220",
+            }
+        )
+        retained = _power_at_or_before_cutoff(power, cutoff, history_days=14)
+
+        with patch(
+            "generate_power_soc_ensemble._power_frame",
+            wraps=__import__("generate_power_soc_ensemble")._power_frame,
+        ) as power_frame:
+            bounded = build_ensemble_dataset(retained, deterministic, solar, horizon_hours=6)
+        full = build_ensemble_dataset(power, deterministic, solar, horizon_hours=6)
+
+        self.assertEqual(list(power_frame.call_args_list[0].args[0].data_vars), ["BatterySOC"])
+        self.assertIn("ACOutputWatts", power_frame.call_args_list[1].args[0].data_vars)
+        for name in (
+            "BatterySOCForecastEnsemble",
+            "ForecastSolarWattsEnsemble",
+            "ForecastLoadWattsEnsemble",
+        ):
+            np.testing.assert_allclose(bounded[name], full[name])
+
+    def test_ensemble_skill_matches_full_history_for_long_lead_reference(self) -> None:
+        end = pd.Timestamp("2026-07-20T00:00:00")
+        issue = end - pd.Timedelta(days=11)
+        valid = issue + pd.Timedelta(hours=95)
+        forecast = xr.Dataset(
+            {
+                "BatterySOCForecastEnsemble": (
+                    ("member", "time"),
+                    np.asarray([[80.0, 76.0], [80.0, 75.0], [80.0, 74.0]]),
+                )
+            },
+            coords={"member": [1, 2, 3], "time": [issue, valid]},
+            attrs={
+                "initial_soc_time": issue.isoformat(),
+                "ecmwf_cycle_time": issue.isoformat(),
+            },
+        )
+        archive = append_ensemble_archive(forecast, self.tmp_ensemble_archive_path)
+        power_times = pd.date_range(end - pd.Timedelta(days=20), end, freq="1h")
+        power = xr.Dataset(
+            {
+                "BatterySOC": (
+                    ("time",),
+                    np.linspace(90.0, 70.0, len(power_times)),
+                ),
+                "ACOutputWatts": (("time",), np.full(len(power_times), 200.0)),
+            },
+            coords={"time": power_times},
+        )
+        retained = _power_at_or_before_cutoff(power, end, history_days=14)
+
+        with patch(
+            "generate_power_soc_ensemble._power_frame",
+            wraps=__import__("generate_power_soc_ensemble")._power_frame,
+        ) as power_frame:
+            bounded = build_ensemble_skill_dataset(archive, retained)
+        full = build_ensemble_skill_dataset(archive, power)
+
+        self.assertEqual(list(power_frame.call_args.args[0].data_vars), ["BatterySOC"])
+        np.testing.assert_array_equal(bounded["time"], full["time"])
+        for name in bounded.data_vars:
+            np.testing.assert_allclose(bounded[name], full[name], equal_nan=True)
+        self.assertTrue(np.isfinite(bounded["ForecastSOCCRPS_48_96h"]).any())
 
     def test_ensemble_load_members_span_one_stationary_state_distribution(self) -> None:
         power_times = pd.date_range("2026-07-10T00:00:00", periods=49, freq="1h")

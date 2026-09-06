@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 from dataclasses import replace
@@ -23,6 +24,7 @@ from generate_power_soc_forecast import (
     DEFAULT_LATITUDE,
     DEFAULT_LONGITUDE,
     DEFAULT_OPEN_DATA_SOURCE,
+    SOLAR_MPP_MODE_FIELDS,
     _bounded_load_profile,
     _forecast_integration_times,
     _power_frame,
@@ -71,6 +73,30 @@ POWER_ECMWF_ENSEMBLE_TMP_DIR = Path(
 
 ENSEMBLE_MEMBERS = tuple(range(1, 51))
 LEAD_BUCKETS = (("0_6h", 0.0, 6.0), ("6_24h", 6.0, 24.0), ("24_48h", 24.0, 48.0), ("48_96h", 48.0, 96.0))
+ENSEMBLE_SKILL_RETENTION_DAYS = 7.0
+ENSEMBLE_SKILL_VERIFICATION_WINDOW_DAYS = 1.0
+ENSEMBLE_MAX_LEAD_DAYS = max(stop for _, _, stop in LEAD_BUCKETS) / 24.0
+ENSEMBLE_POWER_MIN_HISTORY_DAYS = (
+    ENSEMBLE_SKILL_RETENTION_DAYS
+    + ENSEMBLE_SKILL_VERIFICATION_WINDOW_DAYS
+    + ENSEMBLE_MAX_LEAD_DAYS
+)
+ENSEMBLE_POWER_HISTORY_DAYS = float(
+    os.environ.get(
+        "AURORA_POWER_ENSEMBLE_HISTORY_DAYS",
+        str(max(14.0, ENSEMBLE_POWER_MIN_HISTORY_DAYS)),
+    )
+)
+ENSEMBLE_POWER_SOURCE_FIELDS = (
+    "BatterySOC",
+    "SolarWatts_East",
+    "SolarWatts_South",
+    "SolarWatts_West",
+    *SOLAR_MPP_MODE_FIELDS,
+    "BatteryWatts",
+    "ACOutputWatts",
+    "DCInverterWatts",
+)
 ENSEMBLE_FORECAST_PROVENANCE_ATTRS = (
     "forecast_model_name",
     "forecast_model_version",
@@ -231,26 +257,57 @@ def _validate_power_cutoff_anchor(
 def _power_at_or_before_cutoff(
     power: xr.Dataset,
     cutoff: pd.Timestamp | None,
+    *,
+    history_days: float = ENSEMBLE_POWER_HISTORY_DAYS,
 ) -> xr.Dataset:
-    """Slice live power to an exact paired SOC anchor, failing closed on gaps."""
-    if cutoff is None:
-        return power
+    """Return a lazy, bounded power view ending at the paired SOC anchor.
+
+    The ensemble skill surface needs seven retained days, its trailing 24-hour
+    verification window, and up to 96 hours of issue-time persistence anchors.
+    Keeping that complete window prevents the millions of older one-second APS
+    samples from being materialised by each downstream pandas conversion.
+    """
+    retained_days = float(history_days)
+    if not math.isfinite(retained_days) or retained_days < ENSEMBLE_POWER_MIN_HISTORY_DAYS:
+        raise ValueError(
+            "Ensemble power history must retain at least "
+            f"{ENSEMBLE_POWER_MIN_HISTORY_DAYS:g} days (7-day skill, 24-hour "
+            "verification, and 96-hour issue anchors)"
+        )
     if "time" not in power.coords:
         raise ValueError("Power dataset has no time coordinate for the ensemble cutoff")
     times = pd.to_datetime(np.asarray(power["time"].values), errors="coerce", utc=True).tz_localize(None)
-    selected_indices = np.flatnonzero((~times.isna()) & (times <= cutoff))
-    if selected_indices.size == 0:
+    valid_times = times[~times.isna()]
+    if not len(valid_times):
+        if cutoff is None:
+            raise ValueError("Power dataset has no valid timestamps")
         raise ValueError(f"No APS power data exist at or before ensemble cutoff {cutoff.isoformat()}")
-    selected = power.isel(time=selected_indices)
-    frame = _power_frame(selected)
+    end = pd.Timestamp(valid_times.max()) if cutoff is None else _normalise_utc_timestamp(cutoff, field="power cutoff")
+    eligible = (~times.isna()) & (times <= end)
+    if not eligible.any():
+        raise ValueError(f"No APS power data exist at or before ensemble cutoff {end.isoformat()}")
+    start = (end - pd.Timedelta(days=retained_days)).normalize()
+    fields = [name for name in ENSEMBLE_POWER_SOURCE_FIELDS if name in power]
+    selected_source = power[fields]
+    if times.is_monotonic_increasing:
+        selected = selected_source.sel(time=slice(start, end))
+    else:
+        selected = selected_source.isel(
+            time=eligible & (times >= start)
+        )
+    frame = _power_frame(selected[["BatterySOC"]] if "BatterySOC" in selected else selected)
     if frame.empty or "BatterySOC" not in frame:
-        raise ValueError(f"No APS BatterySOC data exist at or before ensemble cutoff {cutoff.isoformat()}")
+        raise ValueError(f"No APS BatterySOC data exist at or before ensemble cutoff {end.isoformat()}")
     latest_time, _ = latest_finite(frame["BatterySOC"])
-    if latest_time != cutoff:
+    if cutoff is not None and latest_time != end:
         raise ValueError(
             "APS power does not contain a finite BatterySOC sample at the exact ensemble cutoff "
-            f"{cutoff.isoformat()} (latest is {latest_time.isoformat()})"
+            f"{end.isoformat()} (latest is {latest_time.isoformat()})"
         )
+    selected.attrs = dict(selected.attrs)
+    selected.attrs["ensemble_power_history_days"] = f"{retained_days:g}"
+    selected.attrs["ensemble_power_window_start_utc"] = start.isoformat()
+    selected.attrs["ensemble_power_window_end_utc"] = end.isoformat()
     return selected
 
 
@@ -525,7 +582,8 @@ def build_ensemble_dataset(
     *,
     horizon_hours: int = DEFAULT_HORIZON_HOURS,
 ) -> xr.Dataset:
-    frame = _power_frame(power)
+    soc_power = power[["BatterySOC"]] if "BatterySOC" in power else power
+    frame = _power_frame(soc_power)
     latest_time, latest_soc = latest_finite(frame["BatterySOC"])
     member_dim = _member_dimension(solar_ensemble)
     member_values = np.asarray(solar_ensemble[member_dim].values)
@@ -560,7 +618,13 @@ def build_ensemble_dataset(
         finite_load = source_load[np.isfinite(source_load)]
         fallback_level = float(np.nanmedian(finite_load)) if finite_load.size else np.nan
     if not np.isfinite(fallback_level):
-        raw_load = build_historical_load_forecast(frame, common_times, end=latest_time, calibration_days=7)
+        load_frame = _power_frame(power)
+        raw_load = build_historical_load_forecast(
+            load_frame,
+            common_times,
+            end=latest_time,
+            calibration_days=7,
+        )
         bounded_load, _ = _bounded_load_profile(raw_load, correction_w)
         fallback_level = float(bounded_load.median())
     # This operational ensemble represents the detected system as it is now.
@@ -945,8 +1009,14 @@ def _ensemble_semantic_issue_mask(archive: xr.Dataset) -> np.ndarray:
     return selected
 
 
-def build_ensemble_skill_dataset(archive: xr.Dataset, power: xr.Dataset, *, retention_days: float = 7.0) -> xr.Dataset:
-    frame = _power_frame(power)
+def build_ensemble_skill_dataset(
+    archive: xr.Dataset,
+    power: xr.Dataset,
+    *,
+    retention_days: float = ENSEMBLE_SKILL_RETENTION_DAYS,
+) -> xr.Dataset:
+    soc_power = power[["BatterySOC"]] if "BatterySOC" in power else power
+    frame = _power_frame(soc_power)
     observed = frame.get("BatterySOC", pd.Series(dtype=np.float64))
     end = pd.Timestamp(frame.index.max())
     times = pd.date_range((end - pd.Timedelta(days=retention_days)).floor("1h"), end.ceil("1h"), freq="1h")
@@ -1135,6 +1205,7 @@ def generate(
     source: str = DEFAULT_OPEN_DATA_SOURCE,
     cache_dir: Path = POWER_ECMWF_ENSEMBLE_TMP_DIR,
     power_cutoff_time: pd.Timestamp | str | None = None,
+    power_history_days: float = ENSEMBLE_POWER_HISTORY_DAYS,
 ) -> Path:
     cutoff = (
         _normalise_utc_timestamp(power_cutoff_time, field="power_cutoff_time")
@@ -1178,7 +1249,11 @@ def generate(
                 if archive_zarr.exists():
                     archive = xr.open_zarr(archive_zarr, chunks={}).load()
                     power = xr.open_zarr(power_zarr, chunks={})
-                    cutoff_power = _power_at_or_before_cutoff(power, cutoff)
+                    cutoff_power = _power_at_or_before_cutoff(
+                        power,
+                        cutoff,
+                        history_days=power_history_days,
+                    )
                     skill = build_ensemble_skill_dataset(archive, cutoff_power)
                     _write_time_product(skill, skill_zarr)
                     power.close()
@@ -1218,7 +1293,11 @@ def generate(
         power = xr.open_zarr(power_zarr, chunks={})
         deterministic = xr.open_zarr(deterministic_zarr, chunks={})
         _validate_power_cutoff_anchor(deterministic.attrs, cutoff)
-        cutoff_power = _power_at_or_before_cutoff(power, cutoff)
+        cutoff_power = _power_at_or_before_cutoff(
+            power,
+            cutoff,
+            history_days=power_history_days,
+        )
         cycle_time = cycle or pd.Timestamp(np.asarray(solar["time"].values).reshape(-1)[0])
         composite_source = _ensemble_composite_source_identity(
             solar,
@@ -1229,6 +1308,15 @@ def generate(
         forecast = build_ensemble_dataset(cutoff_power, deterministic, solar, horizon_hours=horizon_hours)
         if cutoff is not None:
             forecast.attrs["power_input_cutoff_time_utc"] = cutoff.isoformat()
+        forecast.attrs["power_input_history_days"] = cutoff_power.attrs[
+            "ensemble_power_history_days"
+        ]
+        forecast.attrs["power_input_window_start_utc"] = cutoff_power.attrs[
+            "ensemble_power_window_start_utc"
+        ]
+        forecast.attrs["power_input_window_end_utc"] = cutoff_power.attrs[
+            "ensemble_power_window_end_utc"
+        ]
         forecast.attrs["ecmwf_cycle_time"] = pd.Timestamp(cycle_time).isoformat()
         forecast.attrs.update(composite_source)
         forecast.attrs["forecast_identity_id"] = forecast_identity_id(forecast.attrs)
@@ -1268,6 +1356,16 @@ def main() -> None:
         "--power-cutoff-time",
         help="Exact deterministic initial_soc_time; ignore newer live APS power samples",
     )
+    parser.add_argument(
+        "--power-history-days",
+        type=float,
+        default=ENSEMBLE_POWER_HISTORY_DAYS,
+        help=(
+            "APS history retained for ensemble load fallback and skill verification "
+            f"(default: {ENSEMBLE_POWER_HISTORY_DAYS:g}; minimum: "
+            f"{ENSEMBLE_POWER_MIN_HISTORY_DAYS:g})"
+        ),
+    )
     args = parser.parse_args()
     generate(
         power_zarr=args.power_zarr,
@@ -1282,6 +1380,7 @@ def main() -> None:
         source=args.source,
         cache_dir=args.cache_dir,
         power_cutoff_time=args.power_cutoff_time,
+        power_history_days=args.power_history_days,
     )
 
 
