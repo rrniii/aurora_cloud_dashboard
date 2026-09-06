@@ -16,6 +16,30 @@ import app
 
 
 class DashboardShellTests(TestCase):
+    def test_naive_utc_datetime_rejects_non_finite_timestamp(self) -> None:
+        self.assertIsNone(app._as_naive_utc_datetime(pd.NaT))
+        self.assertIsNone(app._as_naive_utc_datetime(np.datetime64("NaT")))
+
+    def test_science_quicklook_falls_back_when_latest_bound_is_nat(self) -> None:
+        start = datetime(2026, 9, 6, 0, 0)
+        end = datetime(2026, 9, 6, 12, 0)
+        with TemporaryDirectory() as tmpdir:
+            latest_path = Path(tmpdir) / "latest.png"
+            latest_path.touch()
+            with (
+                patch.object(app, "_cfg", return_value={"quicklook_dir": tmpdir}),
+                patch.object(app, "_is_stacked_timeseries_instrument", return_value=True),
+                patch.object(app, "_dataset_time_bounds", return_value=(pd.NaT, pd.NaT)),
+                patch.object(app, "summary_latest_png", return_value=latest_path),
+            ):
+                resolved = app._science_quicklook_path_for_interactive(
+                    "power",
+                    start=start,
+                    end=end,
+                )
+
+        self.assertEqual(resolved, latest_path)
+
     def test_auroracam_detail_panes_refresh_without_rebuilding_thumbnail_grid(self) -> None:
         with patch.object(app, "_auroracam_viewer_markup", return_value="<div>selected camera</div>") as render:
             app._refresh_auroracam_detail()
