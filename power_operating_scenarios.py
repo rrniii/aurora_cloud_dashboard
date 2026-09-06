@@ -3717,7 +3717,7 @@ def build_operating_scenarios(
         load_phase_codes.append(central_phases)
         load_phase_epochs.append(np.cumsum(phase_changed).astype(np.int16))
         on = np.asarray(["CL61" in mode_kits(value) for value in modes], dtype=bool)
-        collection_hours.append(float(np.count_nonzero(on[1:])))
+        collection_hours.append(_instrument_hours(times, modes, "CL61"))
         scenario_minimum_p10 = float(np.nanmin(p10))
         if np.isclose(
             scenario_minimum_p10,
@@ -3803,6 +3803,13 @@ def build_operating_scenarios(
         )
         for kit in OPERATING_PRIORITY
     }
+    # ``completed_modes`` carries the current physical state through the
+    # planning-only safety tail after the 96-hour decision.  That tail is
+    # valuable for reserve validation, but it is not scheduled collection and
+    # must never be presented as such.
+    collection_hours[optimized_index] = float(
+        optimized_instrument_hours.get("CL61", 0.0)
+    )
     optimized_instrument_starts = {
         kit: _instrument_starts(
             optimized_modes,
@@ -4075,6 +4082,7 @@ def evaluate_custom_schedule(
     start_time: pd.Timestamp,
     duration_hours: int,
     kit: str = "CL61",
+    decision_horizon_hours: int = 96,
 ) -> dict[str, Any]:
     times = pd.DatetimeIndex(scenarios["time"].values)
     components = tuple(str(value) for value in scenarios["component"].values)
@@ -4084,6 +4092,13 @@ def evaluate_custom_schedule(
     component_members = np.asarray(scenarios["ComponentLoadWatts"].values, dtype=np.float64)
     base_mode = str(scenarios.attrs.get("scenario_base_mode", scenarios.attrs.get("current_mode", MODE_DC_ONLY)))
     modes = _schedule_modes(times, base_mode, pd.Timestamp(start_time), int(duration_hours), kit)
+    decision_end = times.min() + pd.Timedelta(hours=max(int(decision_horizon_hours), 0))
+    decision_count = int(np.count_nonzero(times <= decision_end))
+    off_mode = _mode_with_kit(base_mode, kit, False)
+    modes = tuple(
+        mode if index < decision_count else off_mode
+        for index, mode in enumerate(modes)
+    )
     loads = _load_members_for_modes(component_members, modes)
     soc = integrate_soc_members(
         initial_soc=float(scenarios.attrs["initial_soc_pct"]),
@@ -4098,6 +4113,7 @@ def evaluate_custom_schedule(
         ),
     )
     p10 = np.nanquantile(soc, 0.10, axis=0)
+    decision_p10 = p10[:decision_count]
     return {
         "time": times,
         "modes": modes,
@@ -4108,7 +4124,20 @@ def evaluate_custom_schedule(
         "soc_p50": np.nanquantile(soc, 0.50, axis=0),
         "soc_p90": np.nanquantile(soc, 0.90, axis=0),
         "below_40_probability": np.mean(soc < MINIMUM_OPERATIONAL_SOC_PCT, axis=0),
-        "collection_hours": float(np.count_nonzero([kit in mode_kits(value) for value in modes[1:]])),
+        "collection_hours": _instrument_hours(
+            times,
+            modes,
+            kit,
+            limit=decision_count,
+        ),
+        "decision_horizon_hours": float(
+            (times[decision_count - 1] - times[0]) / pd.Timedelta(hours=1)
+        ),
+        "decision_minimum_p10_soc": float(np.nanmin(decision_p10)),
+        "decision_final_p10_soc": float(decision_p10[-1]),
+        "safety_horizon_hours": float(
+            (times[-1] - times[0]) / pd.Timedelta(hours=1)
+        ),
         "minimum_p10_soc": float(np.nanmin(p10)),
         "final_p10_soc": float(p10[-1]),
         "safe": bool(np.nanmin(p10) >= MINIMUM_OPERATIONAL_SOC_PCT),
