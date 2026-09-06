@@ -16,6 +16,7 @@ from generate_power_prod_dev_evaluation import (
     run_evaluation,
 )
 from power_prod_dev_evaluation import (
+    _atomic_write_evidence_zarr,
     attach_paired_observations,
     build_exact_intersection_evidence,
     paired_observation_view,
@@ -193,6 +194,32 @@ def test_paired_products_are_separate_and_append_history() -> None:
 
     assert first["pairedRows"] == 2
     assert len(history) == 2
+
+
+def test_evidence_promotion_failure_restores_prior_tree() -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        output = root / "paired.zarr"
+        output.mkdir()
+        marker = output / "prior-evidence"
+        marker.write_text("immutable prior result", encoding="utf-8")
+        original_rename = Path.rename
+
+        def fail_staging_promotion(path: Path, target: Path) -> Path:
+            if path.name == f".{output.name}.tmp":
+                raise RuntimeError("interrupted promotion")
+            return original_rename(path, target)
+
+        with patch.object(Path, "rename", autospec=True, side_effect=fail_staging_promotion):
+            with pytest.raises(RuntimeError, match="interrupted promotion"):
+                _atomic_write_evidence_zarr(
+                    xr.Dataset({"value": (("record",), [1.0])}),
+                    output,
+                )
+
+        assert marker.read_text(encoding="utf-8") == "immutable prior result"
+        assert not output.with_name(f".{output.name}.previous").exists()
+        assert not output.with_name(f".{output.name}.tmp").exists()
 
 
 def test_empty_pairing_skips_invalid_power_store_and_records_lifecycle() -> None:

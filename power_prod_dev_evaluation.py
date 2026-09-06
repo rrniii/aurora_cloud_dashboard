@@ -11,13 +11,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from generate_power_soc_forecast import _atomic_write_zarr, _write_state
+from generate_power_soc_forecast import _write_state
 from power_v12_hybrid import LEAD_BUCKETS, stable_json_digest, utc_now_iso
 
 
@@ -36,6 +37,48 @@ POWER_OBSERVATION_FIELDS = (
     "DCInverterWatts",
 )
 OBSERVATION_MATCH_TOLERANCE = pd.Timedelta(minutes=10)
+
+
+def _atomic_write_evidence_zarr(ds: xr.Dataset, output_zarr: Path) -> None:
+    """Replace paired evidence while retaining the prior tree until promotion."""
+
+    output_zarr = Path(output_zarr)
+    output_zarr.parent.mkdir(parents=True, exist_ok=True)
+    staging = output_zarr.with_name(f".{output_zarr.name}.tmp")
+    previous = output_zarr.with_name(f".{output_zarr.name}.previous")
+    for candidate in (output_zarr, staging, previous):
+        if candidate.is_symlink():
+            raise ValueError("Paired evidence paths must not be symlinks")
+        if candidate.exists() and not candidate.is_dir():
+            raise ValueError("Paired evidence paths must be directories")
+    if previous.exists():
+        if output_zarr.exists():
+            shutil.rmtree(previous)
+        else:
+            previous.rename(output_zarr)
+    if staging.exists():
+        shutil.rmtree(staging)
+    chunk_dim = "time" if "time" in ds.sizes else next(iter(ds.sizes), None)
+    chunked = (
+        ds.chunk({chunk_dim: min(max(ds.sizes.get(chunk_dim, 1), 1), 288)})
+        if chunk_dim is not None
+        else ds
+    )
+    try:
+        chunked.to_zarr(staging, mode="w", consolidated=True)
+        try:
+            if output_zarr.exists():
+                output_zarr.rename(previous)
+            staging.rename(output_zarr)
+        except BaseException:
+            if previous.exists() and not output_zarr.exists():
+                previous.rename(output_zarr)
+            raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    if previous.exists():
+        shutil.rmtree(previous)
 
 
 def _issue_text(archive: xr.Dataset, name: str, issue_count: int) -> np.ndarray:
@@ -672,7 +715,7 @@ def write_paired_products(
     bootstrap_samples: int = 500,
     status_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    _atomic_write_zarr(evidence, Path(output_zarr))
+    _atomic_write_evidence_zarr(evidence, Path(output_zarr))
     summary = paired_score_surface(evidence, bootstrap_samples=bootstrap_samples)
     if status_context:
         summary = {**summary, **status_context}
