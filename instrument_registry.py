@@ -24,6 +24,7 @@ class InstrumentContract:
     pdu_outlet: int | None = None
     pdu_title: str | None = None
     automatic_phase_labels: tuple[tuple[str, str], ...] = ()
+    legacy_science_latest_alias: bool = False
 
 
 INSTRUMENTS: tuple[InstrumentContract, ...] = (
@@ -33,7 +34,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         "battery.100percent",
         "power",
         "power",
-        ("power__summary", "power"),
+        ("power__summary",),
         ("power__HK_APS", "power__hk_aps"),
     ),
     InstrumentContract(
@@ -47,6 +48,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         pdu_outlet=5,
         pdu_title="CL61",
         automatic_phase_labels=(("fan_high", "On with Heater/Blower"),),
+        legacy_science_latest_alias=True,
     ),
     InstrumentContract(
         "cloud-radar",
@@ -58,6 +60,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         ("cloud_radar__HK_Radar", "cloud_radar__hk_radar"),
         pdu_outlet=6,
         pdu_title="Cloud Radar",
+        legacy_science_latest_alias=True,
     ),
     InstrumentContract(
         "hatpro",
@@ -68,6 +71,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         ("hatpro",),
         pdu_outlet=8,
         pdu_title="HATPRO",
+        legacy_science_latest_alias=True,
     ),
     InstrumentContract(
         "vaisalamet",
@@ -75,7 +79,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         "cloud.sun",
         "vaisalamet",
         "vaisalamet",
-        ("vaisalamet__summary", "vaisalamet"),
+        ("vaisalamet__summary",),
         ("vaisalamet__HK_Met", "vaisalamet__hk_met"),
     ),
     InstrumentContract(
@@ -84,7 +88,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         "sun.max",
         "asfs-logger",
         "asfs_logger",
-        ("asfs_logger__summary", "asfs_logger"),
+        ("asfs_logger__summary",),
         ("asfs_logger__HK_ASFS", "asfs_logger__hk_asfs"),
     ),
     InstrumentContract(
@@ -93,7 +97,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         "gauge.with.dots.needle.bottom.50percent",
         "ops-monitor",
         "ops_monitor",
-        ("ops_monitor__summary", "ops_monitor"),
+        ("ops_monitor__summary",),
         ("ops_monitor__HK_Operations", "ops_monitor__hk_operations"),
     ),
     InstrumentContract(
@@ -105,6 +109,7 @@ INSTRUMENTS: tuple[InstrumentContract, ...] = (
         ("wxcam",),
         ("wxcam__HK_WXcam", "wxcam__hk_wxcam"),
         summary_supported=False,
+        legacy_science_latest_alias=True,
     ),
     InstrumentContract(
         "uas",

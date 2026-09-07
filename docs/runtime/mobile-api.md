@@ -125,6 +125,17 @@ token-protected, unknown mode values fail closed, and the legacy
   quicklook dates and image URLs. For an assigned PDU instrument, the response
   also includes its current power state. Clients present an intentional
   power-off as an expected collection pause instead of a missing-data fault.
+  Science listings for Meteorology, Radiation, Aurora Power Supply, and
+  Operations use their explicit `__summary__latest.png` and
+  `__summary__YYYYMMDD.png` products. The unqualified `latest.png` and legacy
+  dated filenames for grouped instruments may contain housekeeping; they are
+  never used as Science fallbacks. A missing summary remains unavailable,
+  while an available dated summary can supply the latest entry. Housekeeping
+  listings continue to use their separate `__hk_*__` products. Ceilometer,
+  Cloud Radar, HATPRO, and WXcam retain their legacy science latest aliases.
+  Quicklook image URLs include a file revision as the final path component,
+  so native image caches refresh when a product is replaced or its selected
+  source changes. Existing unversioned quicklook media URLs remain supported.
 - `GET /wxcam?stream=fish_hdr|pano_hdr&day=latest|YYYY-MM-DD` - stitched MP4,
   day list, poster, and hourly thumbnails.
 - `GET /media/...` - image/video responses with short cache headers and

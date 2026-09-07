@@ -715,7 +715,7 @@ class MobileCatalogTests(unittest.TestCase):
                 resolved = mobile_catalog.resolve_quicklook_path("science", "uas", "latest")
 
         self.assertEqual([entry["token"] for entry in response["entries"]], ["latest", "20260828"])
-        self.assertTrue(response["entries"][0]["imageURL"].startswith("/media/quicklook/science/uas/latest?v="))
+        self.assertTrue(response["entries"][0]["imageURL"].startswith("/media/quicklook/science/uas/latest/"))
         self.assertEqual(resolved.name, "uas__summary__latest.png")
 
     def test_shared_pdu_contract_has_only_assigned_outlets(self) -> None:
@@ -771,6 +771,94 @@ class MobileCatalogTests(unittest.TestCase):
 
         self.assertEqual(response["latest"]["token"], "latest")
         self.assertEqual(resolved, science)
+
+    def test_grouped_science_selects_summary_for_latest_and_history(self) -> None:
+        for instrument_id in ("vaisalamet", "power", "asfs-logger", "ops-monitor"):
+            with self.subTest(instrument=instrument_id), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                instrument = mobile_catalog.INSTRUMENT_BY_ID[instrument_id]
+                directory = root / instrument.quicklook_subdir
+                directory.mkdir()
+                prefix = instrument.quicklook_subdir
+                science_latest = directory / f"{prefix}__summary__latest.png"
+                science_daily = directory / f"{prefix}__summary__20260816.png"
+                hk_prefix = instrument.housekeeping_prefixes[-1]
+                hk_latest = directory / f"{hk_prefix}__latest.png"
+                hk_daily = directory / f"{hk_prefix}__20260816.png"
+                for path, content in (
+                    (science_latest, b"curated latest science"),
+                    (science_daily, b"curated daily science"),
+                    (hk_latest, b"latest housekeeping"),
+                    (hk_daily, b"daily housekeeping"),
+                    (directory / "latest.png", b"latest housekeeping"),
+                    (directory / f"{prefix}_20260816.png", b"daily housekeeping"),
+                    (directory / f"{prefix}_20260815.png", b"older housekeeping only"),
+                ):
+                    path.write_bytes(content)
+                    os.utime(path, (300, 300))
+                os.utime(science_latest, (200, 200))
+                os.utime(science_daily, (100, 100))
+
+                with patch.dict(os.environ, {"AURORA_QUICKLOOK_ROOT": str(root)}):
+                    listing = mobile_catalog.quicklooks("science", instrument_id)
+                    self.assertEqual([entry["token"] for entry in listing["entries"]], ["latest", "20260816"])
+                    for token, science, housekeeping in (
+                        ("latest", science_latest, hk_latest),
+                        ("20260816", science_daily, hk_daily),
+                    ):
+                        self.assertEqual(mobile_catalog.resolve_quicklook_path("science", instrument_id, token), science)
+                        self.assertEqual(mobile_catalog._find_quicklook_path_by_record(instrument, "science", token), science)
+                        self.assertEqual(mobile_catalog.resolve_quicklook_path("housekeeping", instrument_id, token), housekeeping)
+                    self.assertIsNone(mobile_catalog.resolve_quicklook_path("science", instrument_id, "20260815"))
+
+    def test_grouped_science_does_not_fall_back_to_housekeeping_aliases(self) -> None:
+        for instrument_id in ("vaisalamet", "power", "asfs-logger", "ops-monitor"):
+            with self.subTest(instrument=instrument_id), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                instrument = mobile_catalog.INSTRUMENT_BY_ID[instrument_id]
+                directory = root / instrument.quicklook_subdir
+                directory.mkdir()
+                for filename in (
+                    "latest.png",
+                    f"{instrument.quicklook_subdir}_20260816.png",
+                    f"{instrument.housekeeping_prefixes[-1]}__latest.png",
+                    f"{instrument.housekeeping_prefixes[-1]}__20260816.png",
+                ):
+                    (directory / filename).write_bytes(b"housekeeping only")
+                with patch.dict(os.environ, {"AURORA_QUICKLOOK_ROOT": str(root)}):
+                    listing = mobile_catalog.quicklooks("science", instrument_id)
+                    self.assertEqual(listing["entries"], [])
+                    self.assertIsNone(listing["latest"])
+                    for token in ("latest", "20260816"):
+                        self.assertIsNone(mobile_catalog.resolve_quicklook_path("science", instrument_id, token))
+                        self.assertIsNone(mobile_catalog._find_quicklook_path_by_record(instrument, "science", token))
+
+    def test_grouped_science_latest_can_use_dated_summary_without_accepting_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "vaisalamet"
+            directory.mkdir()
+            daily = directory / "vaisalamet__summary__20260816.png"
+            daily.write_bytes(b"curated science")
+            (directory / "latest.png").write_bytes(b"newer housekeeping")
+            (directory / "vaisalamet_20260817.png").write_bytes(b"newer housekeeping")
+            with patch.dict(os.environ, {"AURORA_QUICKLOOK_ROOT": str(root)}):
+                listing = mobile_catalog.quicklooks("science", "vaisalamet")
+                self.assertEqual(mobile_catalog.resolve_quicklook_path("science", "vaisalamet", "latest"), daily)
+                self.assertEqual(listing["latest"]["title"], "Latest available (2026-08-16)")
+                self.assertEqual([entry["token"] for entry in listing["entries"]], ["latest", "20260816"])
+
+    def test_ungrouped_science_preserves_legacy_latest_alias(self) -> None:
+        for instrument_id in ("ceilometer", "cloud-radar", "hatpro", "wxcam"):
+            with self.subTest(instrument=instrument_id), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                instrument = mobile_catalog.INSTRUMENT_BY_ID[instrument_id]
+                directory = root / instrument.quicklook_subdir
+                directory.mkdir()
+                latest = directory / "latest.png"
+                latest.write_bytes(b"science")
+                with patch.dict(os.environ, {"AURORA_QUICKLOOK_ROOT": str(root)}):
+                    self.assertEqual(mobile_catalog.resolve_quicklook_path("science", instrument_id, "latest"), latest)
 
     def test_science_latest_uses_newer_dated_product_when_alias_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
