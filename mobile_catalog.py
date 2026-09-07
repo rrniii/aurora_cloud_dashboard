@@ -375,6 +375,16 @@ def versioned_media_url(path: Path, *parts: str) -> str:
     return f"{url}?v={stat_result.st_mtime_ns:x}-{stat_result.st_size:x}"
 
 
+def quicklook_media_url(path: Path, kind: str, instrument_id: str, token: str) -> str:
+    """Refresh decoded native images without query strings older clients encode."""
+    url = media_url("quicklook", kind, instrument_id, token)
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return url
+    return f"{url}/{stat_result.st_mtime_ns:x}-{stat_result.st_size:x}"
+
+
 def dashboard_revision() -> str | None:
     configured = os.environ.get("AURORA_DASHBOARD_REVISION", "").strip()
     if configured:
@@ -2435,7 +2445,7 @@ def instrument_summary(instrument_id: str, window: str = "24h") -> dict[str, Any
                 "id": "latest-quicklook",
                 "title": "Latest quicklook",
                 "kind": "image",
-                "imageURL": media_url("quicklook", "science", instrument_id, "latest"),
+                "imageURL": quicklook_media_url(latest, "science", instrument_id, "latest"),
                 "level": "green",
                 "detail": "Latest generated quicklook",
             }
@@ -2498,9 +2508,14 @@ def _quicklook_paths(instrument: Instrument, kind: str, prefixes: tuple[str, ...
         is_latest = "latest" in name.lower()
         token_match = DATE_TOKEN_RE.search(name)
         matches_prefix = any(name.startswith(prefix) for prefix in prefixes)
-        # ``latest.png`` is the legacy science alias. It has no instrument
-        # prefix but is still a valid science quicklook inside this directory.
-        is_science_latest_alias = kind == "science" and name.lower() == "latest.png"
+        # Only some instruments publish science as ``latest.png``. Grouped
+        # time-series generators copy housekeeping to that legacy alias, so
+        # their Science views must use the explicit summary product instead.
+        is_science_latest_alias = (
+            kind == "science"
+            and instrument.legacy_science_latest_alias
+            and name.lower() == "latest.png"
+        )
         # Science product names may share a base prefix with their housekeeping
         # counterpart (for example ``cloud_radar`` and ``cloud_radar__hk_radar``).
         # Always reject the latter before accepting a science image.
@@ -2545,11 +2560,7 @@ def _quicklook_entries(instrument: Instrument, kind: str, prefixes: tuple[str, .
                     else "Latest" if token == "latest"
                     else _format_date_token(token)
                 ),
-                "imageURL": (
-                    versioned_media_url(path, "quicklook", kind, instrument.id, token)
-                    if instrument.id == "uas"
-                    else media_url("quicklook", kind, instrument.id, token)
-                ),
+                "imageURL": quicklook_media_url(path, kind, instrument.id, token),
                 **file_record(path),
             }
         )
@@ -2568,21 +2579,7 @@ def resolve_quicklook_path(kind: str, instrument_id: str, token: str) -> Path | 
 
 def _find_quicklook_path_by_record(instrument: Instrument, kind: str, token: str) -> Path | None:
     prefixes = instrument.science_prefixes if kind == "science" else instrument.housekeeping_prefixes
-    directory = _instrument_quicklook_root(instrument)
-    if not directory.exists():
-        return None
-    for path in sorted(directory.glob("*")):
-        if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-            continue
-        if token == "latest" and "latest" not in path.name.lower():
-            continue
-        if token != "latest" and token not in path.name:
-            continue
-        is_housekeeping_image = any(path.name.startswith(prefix) for prefix in instrument.housekeeping_prefixes)
-        is_science_latest_alias = kind == "science" and path.name.lower() == "latest.png"
-        if (any(path.name.startswith(prefix) for prefix in prefixes) or is_science_latest_alias) and not (kind == "science" and is_housekeeping_image):
-            return path
-    return None
+    return _quicklook_paths(instrument, kind, prefixes).get(token)
 
 
 def wxcam(stream: str = "fish_hdr", day: str = "latest") -> dict[str, Any]:
