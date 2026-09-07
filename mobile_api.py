@@ -237,7 +237,12 @@ def wxcam(stream: str = Query("fish_hdr"), day: str = Query("latest")) -> dict:
 
 
 @app.get("/media/quicklook/{kind}/{instrument_id}/{token}", dependencies=[Depends(require_read_access)])
-def quicklook_media(request: Request, kind: str, instrument_id: str, token: str) -> Response:
+@app.get("/media/quicklook/{kind}/{instrument_id}/{token}/{revision}", dependencies=[Depends(require_read_access)])
+def quicklook_media(request: Request, kind: str, instrument_id: str, token: str, revision: str | None = None) -> Response:
+    # The revision changes native decoded-image cache keys. Resolve the current
+    # product normally: regeneration between listing and download must still work.
+    if kind not in {"science", "housekeeping"}:
+        raise _not_found("Unknown quicklook kind")
     try:
         path = catalog.resolve_quicklook_path(kind, instrument_id, token)
     except KeyError as exc:

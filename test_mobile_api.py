@@ -506,18 +506,55 @@ class MobileAPITests(unittest.TestCase):
                     "/media/quicklook/science/power/latest",
                     headers={"Authorization": "Bearer secret"},
                 )
+                versioned_media = self.client.get(
+                    listing.json()["latest"]["imageURL"],
+                    headers={"Authorization": "Bearer secret"},
+                )
                 not_modified = self.client.get(
                     "/media/quicklook/science/power/latest",
                     headers={"Authorization": "Bearer secret", "If-None-Match": media.headers["ETag"]},
                 )
 
         self.assertEqual(listing.status_code, 200)
-        self.assertEqual(listing.json()["latest"]["imageURL"], "/media/quicklook/science/power/latest")
+        self.assertTrue(listing.json()["latest"]["imageURL"].startswith("/media/quicklook/science/power/latest/"))
+        self.assertEqual(versioned_media.status_code, 200)
+        self.assertEqual(versioned_media.content, media.content)
         self.assertEqual(media.status_code, 200)
         self.assertEqual(media.content, b"png")
         self.assertIn("ETag", media.headers)
 
         self.assertEqual(not_modified.status_code, 304)
+
+    def test_quicklook_refresh_changes_native_image_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "vaisalamet"
+            directory.mkdir()
+            summary = directory / "vaisalamet__summary__latest.png"
+            summary.write_bytes(b"first science image")
+            (directory / "latest.png").write_bytes(b"legacy housekeeping image")
+            with patch.dict(os.environ, {"AURORA_MOBILE_API_TOKEN": "secret", "AURORA_QUICKLOOK_ROOT": str(root)}):
+                headers = {"Authorization": "Bearer secret"}
+                endpoint = "/quicklooks?kind=science&instrument=vaisalamet"
+                first = self.client.get(endpoint, headers=headers).json()
+                first_url = first["latest"]["imageURL"]
+                first_media = self.client.get(first_url, headers=headers)
+                summary.write_bytes(b"updated science image with new observations")
+                second = self.client.get(endpoint, headers=headers).json()
+                second_url = second["latest"]["imageURL"]
+                second_media = self.client.get(second_url, headers=headers)
+                panel = self.client.get("/instruments/vaisalamet/summary", headers=headers).json()["panels"][0]
+                self.assertNotEqual(first_url, second_url)
+                self.assertNotIn("?", second_url)
+                self.assertEqual(first_media.content, b"first science image")
+                self.assertEqual(second_media.content, b"updated science image with new observations")
+                self.assertEqual(second["entries"][0]["imageURL"], second_url)
+                self.assertEqual(panel["imageURL"], second_url)
+                self.assertEqual(self.client.get(second_url).status_code, 401)
+                self.assertEqual(self.client.get(second_url, headers={**headers, "If-None-Match": second_media.headers["ETag"]}).status_code, 304)
+                # A listing can age while a scheduled generator updates the PNG.
+                self.assertEqual(self.client.get(first_url, headers=headers).content, second_media.content)
+                self.assertEqual(self.client.get(second_url.replace("/science/", "/invalid/"), headers=headers).status_code, 404)
 
     def test_wxcam_listing_and_media_responses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
